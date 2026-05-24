@@ -1,0 +1,17 @@
+node_modules/
+.venv/
+dist/
+build/
+build-resources/
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+
+data/
+output/
+output_test*/
+downloads/
+*.part
+*.xlsx
+~$*.xlsx

@@ -1,0 +1,86 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build Python backend exe
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --clean `
+            --onefile `
+            --name backend `
+            --add-data "static;static" `
+            backend_entry.py
+
+          New-Item -ItemType Directory -Force build-resources/backend | Out-Null
+          Copy-Item dist/backend.exe build-resources/backend/backend.exe -Force
+
+      - name: Download bundled yt-dlp and ffmpeg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build-resources/bin/win | Out-Null
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe" `
+            -OutFile "build-resources/bin/win/yt-dlp.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
+            -OutFile "ffmpeg.zip"
+
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg -Force
+          $ffmpegDir = Get-ChildItem ffmpeg -Directory | Select-Object -First 1
+          Copy-Item "$($ffmpegDir.FullName)/bin/ffmpeg.exe" "build-resources/bin/win/ffmpeg.exe" -Force
+          Copy-Item "$($ffmpegDir.FullName)/bin/ffprobe.exe" "build-resources/bin/win/ffprobe.exe" -Force
+
+      - name: Verify bundled tools
+        shell: pwsh
+        run: |
+          if (!(Test-Path ".\build-resources\backend\backend.exe")) { throw "Missing backend.exe" }
+          .\build-resources\bin\win\yt-dlp.exe --version
+          .\build-resources\bin\win\ffmpeg.exe -version
+          .\build-resources\bin\win\ffprobe.exe -version
+
+      - name: Build Electron Windows installer
+        run: npm run build:win
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MelonMusicDownloader-Windows
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+          if-no-files-found: error

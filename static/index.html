@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Melon Music Batch Downloader</title>
+    <link rel="stylesheet" href="/style.css">
+    <!-- Google Fonts for modern typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <main class="app-container">
+      
+      <!-- Topbar Header -->
+      <header class="app-header">
+        <div class="logo-area">
+          <div class="logo-icon">🎵</div>
+          <div>
+            <h1>Melon Batch Downloader</h1>
+            <p>Tự động tải nhạc & đồng bộ dữ liệu Google Sheet thông minh</p>
+          </div>
+        </div>
+        <div class="header-status">
+          <span id="health" class="status-pill status-loading">Đang kiểm tra...</span>
+        </div>
+      </header>
+
+      <!-- Main Layout -->
+      <div class="app-body">
+        
+        <!-- Left Panel: Configuration -->
+        <aside class="side-panel">
+          <h2 class="panel-title">Cấu Hình Dự Án</h2>
+          
+          <form id="controlForm" class="config-form">
+            <!-- Excel Picker -->
+            <div class="form-group">
+              <label>File Excel đầu vào</label>
+              
+              <!-- Electron File Picker Wrapper -->
+              <div id="excelElectronWrapper" class="picker-wrapper">
+                <button id="excelBrowseBtn" type="button" class="btn-browse">Chọn File Excel</button>
+                <div id="excelPathText" class="path-display" title="Chưa chọn file...">Chưa chọn file...</div>
+              </div>
+              
+              <!-- Standard File Fallback (hidden in Electron) -->
+              <input id="excelFile" type="file" accept=".xlsx" class="fallback-input">
+            </div>
+
+            <!-- Output Folder Picker -->
+            <div class="form-group">
+              <label>Thư mục lưu nhạc</label>
+              
+              <!-- Electron Folder Picker Wrapper -->
+              <div id="outputElectronWrapper" class="picker-wrapper">
+                <button id="outputBrowseBtn" type="button" class="btn-browse">Chọn Thư Mục</button>
+                <div id="outputPathText" class="path-display" title="output">output</div>
+              </div>
+              
+              <!-- Standard Text Fallback (hidden in Electron) -->
+              <input id="outputDir" type="text" value="output" autocomplete="off" class="fallback-input">
+            </div>
+
+            <!-- Google Apps Script Config -->
+            <div class="form-group">
+              <label for="sheetApiUrl">Google Apps Script URL</label>
+              <input id="sheetApiUrl" type="url" value="" placeholder="https://script.google.com/macros/s/.../exec">
+            </div>
+
+            <div class="form-group">
+              <label for="sheetToken">Google API Secret Token</label>
+              <input id="sheetToken" type="text" value="" placeholder="Nhập secret token của Google Apps Script">
+            </div>
+
+            <!-- YouTube Cookies Config -->
+            <div class="form-group">
+              <div class="cookie-header-container">
+                <label>YouTube Cookies</label>
+                <span id="cookieBadge" class="badge badge-none">Không có cookie</span>
+              </div>
+              <div class="cookie-actions-row">
+                <button id="extractChromeBtn" type="button" class="btn-sub">Chrome</button>
+                <button id="extractEdgeBtn" type="button" class="btn-sub">Edge</button>
+                <button id="extractSafariBtn" type="button" class="btn-sub">Safari</button>
+                <button id="extractFirefoxBtn" type="button" class="btn-sub">Firefox</button>
+              </div>
+              <textarea id="cookiesText" rows="3" placeholder="Dán nội dung Netscape cookies.txt tại đây..."></textarea>
+              <button id="saveCookiesBtn" type="button" class="btn-secondary btn-sm">Lưu Cookies</button>
+            </div>
+
+            <!-- Grid Options -->
+            <div class="grid-options">
+              <div class="form-group">
+                <label for="workers">Số luồng tải</label>
+                <input id="workers" type="number" min="1" max="16" value="10">
+              </div>
+
+              <div class="form-group">
+                <label for="maxItems">Giới hạn bài</label>
+                <input id="maxItems" type="number" min="0" value="0" placeholder="0 = Chạy hết">
+              </div>
+            </div>
+
+            <div class="grid-options">
+              <div class="form-group">
+                <label for="startRow">Chạy từ row</label>
+                <input id="startRow" type="number" min="0" value="0" placeholder="0 = từ đầu">
+              </div>
+
+              <div class="form-group">
+                <label for="endRow">Đến row</label>
+                <input id="endRow" type="number" min="0" value="0" placeholder="0 = đến cuối">
+              </div>
+            </div>
+
+            <!-- Execution Actions -->
+            <div class="action-buttons">
+              <button id="startBtn" type="button" class="btn-primary">Bắt Đầu / Chạy Tiếp</button>
+              <button id="stopBtn" type="button" class="btn-secondary">Tạm Dừng Chạy</button>
+              <div class="action-sub-buttons">
+                <button id="flushBtn" type="button" class="btn-text">Đồng bộ Sheet</button>
+                <button id="resetDbBtn" type="button" class="btn-text-danger">Reset Dữ Liệu</button>
+              </div>
+            </div>
+          </form>
+
+          <!-- Counter Card at bottom left -->
+          <div class="counter-card">
+            <span class="card-eyebrow">Tiến Trình Tổng Thể</span>
+            <div class="counter-val">
+              <span id="counter">0 / 0</span>
+              <small class="counter-unit">bài hát</small>
+            </div>
+            <div class="progress-track">
+              <div id="bar" class="progress-bar"></div>
+            </div>
+          </div>
+        </aside>
+
+        <!-- Right Panel: Run Status & Console -->
+        <main class="main-panel">
+          
+          <!-- Top Stats Cards -->
+          <section class="stats-grid">
+            <div class="stat-card state-card">
+              <span class="stat-label">Trạng Thái</span>
+              <strong id="state" class="stat-value state-idle">Sẵn sàng</strong>
+              <span id="rate" class="stat-sub">0 bài/giờ</span>
+            </div>
+            <div class="stat-card success-card">
+              <span class="stat-label">Đã hoàn thành</span>
+              <strong id="stat-done" class="stat-value text-success">0</strong>
+              <span class="stat-sub">Đã xử lý xong</span>
+            </div>
+            <div class="stat-card error-card">
+              <span class="stat-label">Thất bại</span>
+              <strong id="stat-failed" class="stat-value text-error">0</strong>
+              <span class="stat-sub">Lỗi (sẽ thử lại)</span>
+            </div>
+            <div class="stat-card pending-card">
+              <span class="stat-label">Đang chờ</span>
+              <strong id="stat-pending" class="stat-value text-pending">0</strong>
+              <span class="stat-sub">Trong hàng đợi</span>
+            </div>
+          </section>
+
+          <!-- Console log output -->
+          <section class="console-panel">
+            <div class="console-header">
+              <h3>Nhật Ký Tiến Trình</h3>
+              <button id="clearLogsBtn" type="button" class="btn-clear">Xóa nhật ký</button>
+            </div>
+            <div class="console-log-container">
+              <ul id="logs" class="logs-list">
+                <li class="log-info">Hệ thống đã khởi động. Hãy chọn file Excel và nhấn Bắt đầu.</li>
+              </ul>
+            </div>
+          </section>
+
+        </main>
+
+      </div>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+{
+  "name": "melon-music-downloader",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local web app: crawl Melon metadata/lyrics and download audio via yt-dlp.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "server": "PATH=.venv/bin:$PATH python3 -m app.server",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.melon.musicdownloader",
+    "productName": "MelonMusicDownloader",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json",
+      "static/**/*",
+      "!**/.DS_Store"
+    ],
+    "extraResources": [
+      {
+        "from": "build-resources/backend",
+        "to": "backend"
+      },
+      {
+        "from": "build-resources/bin",
+        "to": "bin"
+      }
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
+  }
+}
