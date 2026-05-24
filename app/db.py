@@ -183,6 +183,27 @@ class JobDB:
                 )
         return [self.row_to_song(row) for row in rows]
 
+    def retry_failed_as_pending(
+        self,
+        start_row: int = 0,
+        end_row: int = 0,
+        max_attempts: int = 3,
+    ) -> int:
+        now = utc_now()
+        range_clause, range_params = self._row_range_clause(start_row, end_row)
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE songs
+                SET status='pending', updated_at=?
+                WHERE status='failed'
+                AND attempt_count < ?
+                {range_clause}
+                """,
+                (now, max_attempts, *range_params),
+            )
+            return cursor.rowcount or 0
+
     def mark_done(self, song: SongRecord):
         now = utc_now()
         with self.connect() as conn:

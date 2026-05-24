@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from .config import MAX_NORMAL_RETRY_ATTEMPTS
 from .db import JobDB, utc_now
 from .downloader import YouTubeRateLimitError, download_original_audio
 from .google_sheet import SheetSyncer
@@ -96,6 +97,17 @@ class JobRunner:
                     
                     if free_slots > 0:
                         batch = self.db.claim_pending(free_slots, start_row, end_row)
+                        if not batch and not active_futures:
+                            retry_count = self.db.retry_failed_as_pending(
+                                start_row,
+                                end_row,
+                                MAX_NORMAL_RETRY_ATTEMPTS,
+                            )
+                            if retry_count:
+                                self.log(
+                                    f"Da chay het pending, dua {retry_count} bai loi ve cuoi hang doi de thu lai."
+                                )
+                                batch = self.db.claim_pending(free_slots, start_row, end_row)
                         for song in batch:
                             future = executor.submit(self.process_one, song, output_dir)
                             active_futures.add(future)
