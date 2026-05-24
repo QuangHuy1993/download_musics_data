@@ -66,6 +66,14 @@ jobs:
           Copy-Item "$($ffmpegDir.FullName)/bin/ffmpeg.exe" "build-resources/bin/win/ffmpeg.exe" -Force
           Copy-Item "$($ffmpegDir.FullName)/bin/ffprobe.exe" "build-resources/bin/win/ffprobe.exe" -Force
 
+          Invoke-WebRequest `
+            -Uri "https://nodejs.org/dist/v24.11.1/node-v24.11.1-win-x64.zip" `
+            -OutFile "node.zip"
+
+          Expand-Archive node.zip -DestinationPath node -Force
+          $nodeDir = Get-ChildItem node -Directory | Select-Object -First 1
+          Copy-Item "$($nodeDir.FullName)/node.exe" "build-resources/bin/win/node.exe" -Force
+
       - name: Verify bundled tools
         shell: pwsh
         run: |
@@ -73,6 +81,7 @@ jobs:
           .\build-resources\bin\win\yt-dlp.exe --version
           .\build-resources\bin\win\ffmpeg.exe -version
           .\build-resources\bin\win\ffprobe.exe -version
+          .\build-resources\bin\win\node.exe --version
 
       - name: Build Electron Windows installer
         run: npm run build:win

@@ -363,6 +363,8 @@ def run_ytdlp(query: str, temp_dir: Path, file_name: str, cookies_browser: str =
         "--audio-quality",
         "0",
         "--no-check-certificates",
+        "--js-runtimes",
+        "node",
         "--concurrent-fragments",
         "1",
         "--sleep-requests",

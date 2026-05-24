@@ -293,8 +293,8 @@ async function refreshStatus() {
 }
 
 function renderHealth(data) {
-  const ready = Boolean(data.ytDlp && data.ffmpeg);
-  health.textContent = ready ? "yt-dlp/ffmpeg Sẵn sàng" : "Thiếu yt-dlp/ffmpeg";
+  const ready = Boolean(data.ytDlp && data.ffmpeg && data.node);
+  health.textContent = ready ? "yt-dlp/ffmpeg/node Sẵn sàng" : "Thiếu yt-dlp/ffmpeg/node";
   health.className = ready ? "status-pill status-ok" : "status-pill status-error";
 }
 
