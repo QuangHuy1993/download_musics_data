@@ -146,6 +146,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 RUNNER.stop()
                 self.write_json({"ok": True})
                 return
+            if parsed.path == "/api/log":
+                payload = self.read_json()
+                message = payload.get("message", "")
+                if message:
+                    RUNNER.log(message)
+                self.write_json({"ok": True})
+                return
             if parsed.path == "/api/clear_logs":
                 RUNNER.state["logs"] = []
                 self.write_json({"ok": True})

@@ -478,7 +478,8 @@ async function refreshYouTubeCookiesFromElectron(autoMode) {
     autoMode
       ? "Đang tự làm mới YouTube cookie từ session của app..."
       : "Đang mở YouTube trong app để lấy cookie. Nếu chưa đăng nhập, hãy đăng nhập trong cửa sổ vừa mở.",
-    "warning"
+    "warning",
+    true
   );
 
   try {
@@ -495,10 +496,10 @@ async function refreshYouTubeCookiesFromElectron(autoMode) {
 
     cookiesText.value = result.cookies;
     updateCookieBadge(result.cookies);
-    pushLog(result.message || "Đã làm mới YouTube cookie.", "success");
+    pushLog(result.message || "Đã làm mới YouTube cookie.", "success", true);
     return true;
   } catch (error) {
-    pushLog(`Lỗi làm mới YouTube cookie: ${error.message}`, "error");
+    pushLog(`Lỗi làm mới YouTube cookie: ${error.message}`, "error", true);
     if (autoMode) {
       throw error;
     }
@@ -552,12 +553,20 @@ function setBusy(isBusy) {
   resetDbBtn.disabled = isBusy;
 }
 
-function pushLog(message, type = "info") {
+function pushLog(message, type = "info", syncToBackend = false) {
   const li = document.createElement("li");
   const timeStr = new Date().toLocaleTimeString("vi-VN", { hour12: false });
   li.textContent = `[${timeStr}] ${message}`;
   li.className = `log-${type}`;
   logsEl.prepend(li);
+  
+  if (syncToBackend) {
+    fetch("/api/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: `[Cookie Auto] ${message}` })
+    }).catch(err => console.error("Log sync error:", err));
+  }
 }
 
 async function fetchJson(url, options) {
