@@ -4,6 +4,7 @@ import threading
 import time
 import gc
 import random
+import re
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -16,7 +17,6 @@ from .lyrics import enrich_lyrics
 from .melon import crawl_song
 from .models import SongRecord
 from .jsonl_exporter import ensure_delivery_structure, song_to_json, write_jsonl
-from .utils import is_korean_lyrics, korean_lyrics_score
 
 class JobRunner:
     def __init__(self, db: JobDB, sheet_syncer: SheetSyncer):
@@ -218,15 +218,15 @@ class JobRunner:
             song = enrich_lyrics(song)
 
             song.lyrics = (song.lyrics or "").strip()
-            if not song.lyrics:
-                raise RuntimeError("Skip: khong co lyrics hop le tren Melon/nguon fallback")
-
-            if not is_korean_lyrics(song.lyrics):
-                score = korean_lyrics_score(song.lyrics)
-                raise RuntimeError(
-                    "Skip: lyrics khong phai tieng Han "
-                    f"(hangul={score['hangul']}, ratio={score['hangul_ratio']:.2f})"
-                )
+            
+            # Check if song is Korean by title, artist, or lyrics
+            has_korean_title_or_artist = bool(re.search(r"[가-힣]", song.crawled_song_name or "")) or bool(re.search(r"[가-힣]", song.crawled_singer_name or ""))
+            has_korean_lyrics_text = bool(re.search(r"[가-힣]", song.lyrics)) if song.lyrics else False
+            
+            is_korean = has_korean_title_or_artist or has_korean_lyrics_text
+            
+            if not is_korean:
+                raise RuntimeError("Skip: Khong tim thay chu tieng Han trong tieu de, ca si hoac loi bai hat")
 
             song.language = "韩语"
             song.language_code = "ko"
@@ -245,9 +245,6 @@ class JobRunner:
 
             if not song.crawled_singer_name:
                 raise RuntimeError("Thieu ten ca si")
-
-            if not song.lyrics:
-                raise RuntimeError("Lyrics khong hop le")
 
             if not song.audio_path:
                 raise RuntimeError("Thieu audio")
