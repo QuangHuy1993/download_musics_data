@@ -1,4 +1,5 @@
-const { app, BrowserWindow, ipcMain, dialog, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, session, shell } = require('electron');
+const https = require('https');
 const path = require('path');
 const { spawn } = require('child_process');
 const os = require('os');
@@ -88,6 +89,70 @@ function checkServerReady(callback, attempts = 50) {
   });
 }
 
+function checkForUpdates() {
+  const currentVersion = app.getVersion();
+  const url = 'https://api.github.com/repos/QuangHuy1993/download_musics_data/releases/latest';
+
+  const options = {
+    headers: {
+      'User-Agent': 'MelonMusicDownloader-Updater'
+    }
+  };
+
+  https.get(url, options, (res) => {
+    if (res.statusCode !== 200) {
+      console.error(`Failed to check for updates: HTTP ${res.statusCode}`);
+      return;
+    }
+
+    let data = '';
+    res.on('data', (chunk) => { data += chunk; });
+
+    res.on('end', () => {
+      try {
+        const release = JSON.parse(data);
+        const latestTag = release.tag_name;
+        if (!latestTag) return;
+
+        const cleanLatest = latestTag.replace(/^v/, '');
+        const latestParts = cleanLatest.split('.').map(Number);
+        const currentParts = currentVersion.split('.').map(Number);
+
+        let hasNewVersion = false;
+        for (let i = 0; i < Math.max(latestParts.length, currentParts.length); i++) {
+          const latestPart = latestParts[i] || 0;
+          const currentPart = currentParts[i] || 0;
+          if (latestPart > currentPart) {
+            hasNewVersion = true;
+            break;
+          } else if (latestPart < currentPart) {
+            break;
+          }
+        }
+
+        if (hasNewVersion) {
+          dialog.showMessageBox(mainWindow, {
+            type: 'info',
+            buttons: ['Cập nhật ngay', 'Để sau'],
+            defaultId: 0,
+            title: 'Cập nhật phần mềm',
+            message: `Đã có phiên bản mới (${latestTag})!`,
+            detail: `Phiên bản hiện tại của bạn là v${currentVersion}. Bạn có muốn tải bản cập nhật mới nhất không?`
+          }).then((result) => {
+            if (result.response === 0) {
+              shell.openExternal(release.html_url || 'https://github.com/QuangHuy1993/download_musics_data/releases');
+            }
+          });
+        }
+      } catch (err) {
+        console.error('Error parsing update response:', err);
+      }
+    });
+  }).on('error', (err) => {
+    console.error('Update check error:', err);
+  });
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1050,
@@ -106,6 +171,7 @@ function createWindow() {
   checkServerReady((ready) => {
     if (ready) {
       mainWindow.loadURL('http://127.0.0.1:5173');
+      setTimeout(checkForUpdates, 3000);
     } else {
       mainWindow.loadURL(`data:text/html,<html><body><h3 style="font-family: sans-serif; padding: 20px;">Lỗi: Không khởi động được máy chủ Python phía sau. Hãy thử khởi động lại ứng dụng.</h3></body></html>`);
     }
