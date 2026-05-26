@@ -17,6 +17,7 @@ from .lyrics import enrich_lyrics
 from .melon import crawl_song
 from .models import SongRecord
 from .jsonl_exporter import ensure_delivery_structure, song_to_json, write_jsonl
+from .utils import is_korean_lyrics, clean_lyrics
 
 class JobRunner:
     def __init__(self, db: JobDB, sheet_syncer: SheetSyncer):
@@ -217,16 +218,17 @@ class JobRunner:
             self.seen_keys.add(dedupe_key)
             song = enrich_lyrics(song)
 
-            song.lyrics = (song.lyrics or "").strip()
+            # Clean lyrics first to filter out fake/placeholder Melon text
+            song.lyrics = clean_lyrics(song.lyrics or "")
             
-            # Check if song is Korean by title, artist, or lyrics
-            has_korean_title_or_artist = bool(re.search(r"[가-힣]", song.crawled_song_name or "")) or bool(re.search(r"[가-힣]", song.crawled_singer_name or ""))
+            # Check if song is Korean: must have Korean in title OR have Korean lyrics
+            has_korean_title = bool(re.search(r"[가-힣]", song.crawled_song_name or ""))
             has_korean_lyrics_text = bool(re.search(r"[가-힣]", song.lyrics)) if song.lyrics else False
             
-            is_korean = has_korean_title_or_artist or has_korean_lyrics_text
+            is_korean = has_korean_title or has_korean_lyrics_text
             
             if not is_korean:
-                raise RuntimeError("Skip: Khong tim thay chu tieng Han trong tieu de, ca si hoac loi bai hat")
+                raise RuntimeError("Skip: Khong phai nhac Han (tieu de khong co tieng Han va loi khong dat chuan tieng Han)")
 
             song.language = "韩语"
             song.language_code = "ko"
