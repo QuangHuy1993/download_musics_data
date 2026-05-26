@@ -48,9 +48,22 @@ class JobDB:
                     crawled_singer_name TEXT DEFAULT '',
                     lyrics TEXT DEFAULT '',
                     audio_path TEXT DEFAULT '',
-
+                    local_audio_path TEXT DEFAULT '',
+                    lyric_path TEXT DEFAULT '',
+                    duration REAL DEFAULT 0,
+                    sample_rate TEXT DEFAULT '44.1kHz',
+                    major_genre TEXT DEFAULT '',
+                    sub_genre TEXT DEFAULT '',
+                    album TEXT DEFAULT '',
+                    lyricist TEXT DEFAULT '',
+                    composer TEXT DEFAULT '',
+                    arranger TEXT DEFAULT '',
+                    release_date TEXT DEFAULT '',
+                    like_count TEXT DEFAULT '',
+                    comment_count TEXT DEFAULT '',
+                    language TEXT DEFAULT '韩语',
+                    language_code TEXT DEFAULT 'ko',
                     batch_id INTEGER DEFAULT 0,
-
                     status TEXT DEFAULT 'pending',
                     attempt_count INTEGER DEFAULT 0,
                     error_message TEXT DEFAULT '',
@@ -113,11 +126,7 @@ class JobDB:
             )
 
     def reset_running(self):
-        """Khi khởi động lại chỉ reset các bài đang chạy dở.
-
-        Không reset failed tự động, vì lỗi rate-limit / thiếu lyrics / audio not found
-        nếu retry dồn dập sẽ làm YouTube/Melon khóa lâu hơn.
-        """
+        """Khi khởi động lại chỉ reset các bài đang chạy dở."""
         now = utc_now()
         with self.connect() as conn:
             conn.execute(
@@ -154,8 +163,10 @@ class JobDB:
 
     def reset_db(self):
         with self.connect() as conn:
-            conn.execute("DELETE FROM songs")
-            conn.execute("DELETE FROM sheet_queue")
+            conn.execute("DROP TABLE IF EXISTS songs")
+            conn.execute("DROP TABLE IF EXISTS sheet_queue")
+            conn.execute("DROP TABLE IF EXISTS youtube_cache")
+        self.init()
 
     def import_rows(self, rows: list[dict]) -> dict:
         inserted = 0
@@ -438,37 +449,29 @@ class JobDB:
         allowed = {field.name for field in fields(SongRecord)}
         return SongRecord(**{key: row[key] for key in row.keys() if key in allowed})
 
-    
-
-
-
-
-
-
 
 def get_cached_video(query):
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS youtube_cache (
-            query TEXT PRIMARY KEY,
-            video_id TEXT,
-            created_at TEXT
-            )
-            """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS youtube_cache (
+        query TEXT PRIMARY KEY,
+        video_id TEXT,
+        created_at TEXT
         )
+        """
+    )
 
-        row = conn.execute(
-            "SELECT video_id FROM youtube_cache WHERE query = ?",
-            (query,)
-        ).fetchone()
+    row = conn.execute(
+        "SELECT video_id FROM youtube_cache WHERE query = ?",
+        (query,)
+    ).fetchone()
 
-        conn.close()
+    conn.close()
 
-        if row:
-            return row[0]
-
+    if row:
+        return row[0]
 
 
 def save_cached_video(query, video_id):
@@ -504,4 +507,3 @@ def create_job_db():
 
         return PostgresJobDB(database_url)
     return JobDB()
-

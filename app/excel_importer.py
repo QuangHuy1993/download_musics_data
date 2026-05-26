@@ -84,19 +84,37 @@ def import_json_rows(path: Path) -> list[dict]:
 
     for idx, item in enumerate(data, start=1):
 
-        song_url = item.get("song_url", "").strip()
+        song_url = item.get("song_url", "")
+        if not song_url and isinstance(item.get("extra_info"), dict):
+            song_url = item["extra_info"].get("page_links", "")
+        song_url = song_url.strip()
 
         song_id = parse_song_id(song_url)
 
         if not song_url or not song_id:
             continue
 
+        song_name = item.get("song_name", "")
+        if not song_name:
+            song_name = item.get("music_name", "")
+        song_name = song_name.strip()
+
+        singer_name = item.get("singer_name", "")
+        if not singer_name and isinstance(item.get("extra_info"), dict):
+            singer_name = item["extra_info"].get("artist", "")
+        singer_name = singer_name.strip()
+
+        lyrics = item.get("lyrics", "")
+        if not lyrics:
+            lyrics = item.get("lyric_text", "")
+        lyrics = lyrics.strip()
+
         rows.append({
             "source_row": idx,
-            "song_name": item.get("song_name", "").strip(),
+            "song_name": song_name,
             "song_url": song_url,
-            "singer_name": item.get("singer_name", "").strip(),
-            "lyrics": item.get("lyrics", "").strip(),
+            "singer_name": singer_name,
+            "lyrics": lyrics,
             "song_id": song_id,
         })
 
@@ -109,22 +127,45 @@ def import_jsonl_rows(path: Path) -> list[dict]:
     with open(path, "r", encoding="utf-8") as f:
 
         for idx, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+            except Exception as e:
+                print(f"[Warning] Line {idx} has invalid JSON, skipped: {e}")
+                continue
 
-            item = json.loads(line)
-
-            song_url = item.get("song_url", "").strip()
+            song_url = item.get("song_url", "")
+            if not song_url and isinstance(item.get("extra_info"), dict):
+                song_url = item["extra_info"].get("page_links", "")
+            song_url = song_url.strip()
 
             song_id = parse_song_id(song_url)
 
             if not song_url or not song_id:
                 continue
 
+            song_name = item.get("song_name", "")
+            if not song_name:
+                song_name = item.get("music_name", "")
+            song_name = song_name.strip()
+
+            singer_name = item.get("singer_name", "")
+            if not singer_name and isinstance(item.get("extra_info"), dict):
+                singer_name = item["extra_info"].get("artist", "")
+            singer_name = singer_name.strip()
+
+            lyrics = item.get("lyrics", "")
+            if not lyrics:
+                lyrics = item.get("lyric_text", "")
+            lyrics = lyrics.strip()
+
             rows.append({
                 "source_row": idx,
-                "song_name": item.get("song_name", "").strip(),
+                "song_name": song_name,
                 "song_url": song_url,
-                "singer_name": item.get("singer_name", "").strip(),
-                "lyrics": item.get("lyrics", "").strip(),
+                "singer_name": singer_name,
+                "lyrics": lyrics,
                 "song_id": song_id,
             })
 

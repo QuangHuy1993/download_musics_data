@@ -186,7 +186,7 @@ function createWindow() {
 ipcMain.handle('select-file', async () => {
   const result = await dialog.showOpenDialog({
     properties: ['openFile'],
-    filters: [{ name: 'Excel Files', extensions: ['xlsx'] }]
+    filters: [{ name: 'Input Files', extensions: ['xlsx', 'json', 'jsonl'] }]
   });
   return result.filePaths[0] || '';
 });
