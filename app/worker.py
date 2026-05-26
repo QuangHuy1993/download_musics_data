@@ -179,8 +179,8 @@ class JobRunner:
                                 current_success = None
                         
                         self.update_rate()
-                        if is_success and current_success and current_success % 25 == 0:
-                            cooldown = random.randint(80, 140)
+                        if is_success and current_success and current_success % 10 == 0:
+                            cooldown = random.randint(40, 50)
                             self.log(f"[Global Cooldown] sleeping={cooldown}s (success_count={current_success})")
                             time.sleep(cooldown)
 
