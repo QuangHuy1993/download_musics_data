@@ -165,7 +165,7 @@ def search_youtube_candidates(title: str, artist: str = "", max_results: int = 1
         "noplaylist": True,
         "extract_flat": True,
         "ignoreerrors": True,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "extractor_args": {"youtube": {"player_client": ["ios", "android"]}},
     }
     cookie_file = DATA_DIR / "cookies.txt"
     if use_cookies and cookie_file.exists():
@@ -207,6 +207,92 @@ def search_youtube_candidates(title: str, artist: str = "", max_results: int = 1
         }
         for score, video in ranked[:max_results]
         if video.get("id")
+    ]
+
+
+def _score_soundcloud_candidate(track: dict, title: str, artist: str) -> int:
+    expected_title = _normalize_search_text(title)
+    expected_artist = _normalize_search_text(artist)
+    track_title = _normalize_search_text(str(track.get("title") or ""))
+    uploader = _normalize_search_text(
+        str(track.get("uploader") or track.get("channel") or "")
+    )
+    haystack = f"{track_title} {uploader}"
+
+    score = 0
+    if expected_title and expected_title in track_title:
+        score += 60
+    else:
+        title_tokens = [token for token in expected_title.split() if len(token) >= 2]
+        if title_tokens:
+            matched = sum(1 for token in title_tokens if token in track_title)
+            score += int(45 * matched / len(title_tokens))
+
+    if expected_artist and expected_artist in haystack:
+        score += 25
+    else:
+        artist_tokens = [token for token in expected_artist.split() if len(token) >= 2]
+        if artist_tokens:
+            matched = sum(1 for token in artist_tokens if token in haystack)
+            score += int(18 * matched / len(artist_tokens))
+
+    duration = track.get("duration")
+    if isinstance(duration, (int, float)):
+        if 45 <= duration <= 900:
+            score += 5
+        elif duration > 900:
+            score -= 40
+
+    title_lower = str(track.get("title") or "").lower()
+    if any(bad in title_lower for bad in ("cover", "karaoke", "reaction", "remix", "mix")):
+        score -= 20
+
+    return score
+
+
+def search_soundcloud_candidates(title: str, artist: str = "", max_results: int = 12) -> list[dict]:
+    candidates_by_id: dict[str, tuple[int, dict]] = {}
+
+    ydl_opts = {
+        "quiet": True,
+        "noprogress": True,
+        "logger": _YtdlpQuietLogger(),
+        "skip_download": True,
+        "default_search": "scsearch",
+        "noplaylist": True,
+        "extract_flat": True,
+        "ignoreerrors": True,
+    }
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            for query in _unique_search_queries(title, artist):
+                search_query = f"scsearch8:{query}"
+                print(f"[SOUNDCLOUD SEARCH] {search_query}")
+                info = ydl.extract_info(search_query, download=False)
+                entries = (info or {}).get("entries") or []
+                for track in entries:
+                    if not track or not track.get("url"):
+                        continue
+                    score = _score_soundcloud_candidate(track, title, artist)
+                    track_url = track["url"]
+                    current = candidates_by_id.get(track_url)
+                    if current is None or score > current[0]:
+                        candidates_by_id[track_url] = (score, track)
+    except Exception as e:
+        print(f"SoundCloud search failed: {e}")
+        return []
+
+    ranked = sorted(candidates_by_id.values(), key=lambda item: item[0], reverse=True)
+    return [
+        {
+            "id": track.get("id") or track.get("url"),
+            "title": track.get("title"),
+            "url": track.get("url"),
+            "score": score,
+        }
+        for score, track in ranked[:max_results]
+        if track.get("url")
     ]
 
 
@@ -371,24 +457,49 @@ def download_original_audio(song, output_dir):
     cache_key = _youtube_cache_key(title, artist)
     cached_video_id = db.get_cached_video(cache_key)
     candidates = []
+    is_soundcloud = False
+
     if cached_video_id:
-        candidates.append(
-            {
-                "id": cached_video_id,
-                "title": title,
-                "url": f"https://www.youtube.com/watch?v={cached_video_id}",
-            }
-        )
-    candidates.extend(
-        candidate
-        for candidate in search_youtube_candidates(title, artist, max_results=4)
-        if candidate["id"] != cached_video_id
-    )
+        if cached_video_id.startswith("http://") or cached_video_id.startswith("https://") or "soundcloud" in cached_video_id:
+            candidates.append(
+                {
+                    "id": cached_video_id,
+                    "title": title,
+                    "url": cached_video_id,
+                }
+            )
+            is_soundcloud = True
+        else:
+            candidates.append(
+                {
+                    "id": cached_video_id,
+                    "title": title,
+                    "url": f"https://www.youtube.com/watch?v={cached_video_id}",
+                }
+            )
 
     if not candidates:
-        raise RuntimeError(f"Khong tim thay YouTube video: {query}")
+        try:
+            candidates.extend(
+                candidate
+                for candidate in search_youtube_candidates(title, artist, max_results=4)
+                if candidate["id"] != cached_video_id
+            )
+        except Exception as e:
+            print(f"[YouTube Search Error] {e}. Falling back to SoundCloud search.")
+            
+        if not candidates:
+            print(f"[SoundCloud Fallback] Searching SoundCloud for: {query}")
+            try:
+                candidates.extend(search_soundcloud_candidates(title, artist, max_results=4))
+                is_soundcloud = True
+            except Exception as se:
+                print(f"[SoundCloud Search Error] {se}")
 
-    output_dir = Path(output_dir)
+    if not candidates:
+        raise RuntimeError(f"Khong tim thay video tren ca YouTube va SoundCloud: {query}")
+
+    output_dir = Path(output_dir).resolve()
     folder_name = sanitize_path(
         f"{song.crawled_singer_name or 'unknown'} - {song.crawled_song_name or song.song_id or 'unknown'}"
     )
@@ -407,6 +518,22 @@ def download_original_audio(song, output_dir):
                 selected_video = video
                 break
             except YouTubeRateLimitError:
+                # If YouTube rate limits download, try SoundCloud immediately as fallback
+                if not is_soundcloud:
+                    print("[YouTube Download Rate Limit] Trying SoundCloud fallback...")
+                    sc_candidates = search_soundcloud_candidates(title, artist, max_results=4)
+                    if sc_candidates:
+                        for sc_video in sc_candidates:
+                            try:
+                                audio_path, audio_info = download_url(sc_video["url"], audio_stem)
+                                selected_video = sc_video
+                                is_soundcloud = True
+                                break
+                            except Exception as sc_exc:
+                                last_error = str(sc_exc)
+                                continue
+                        if audio_path:
+                            break
                 raise
             except Exception as exc:
                 last_error = str(exc)
@@ -414,7 +541,7 @@ def download_original_audio(song, output_dir):
 
         if not audio_path or not selected_video:
             raise RuntimeError(
-                f"Khong tai duoc audio-only m4a tu YouTube: {query}. Loi cuoi: {last_error}"
+                f"Khong tai duoc audio: {query}. Loi cuoi: {last_error}"
             )
     except Exception:
         if track_dir.exists():
@@ -424,7 +551,7 @@ def download_original_audio(song, output_dir):
                 pass
         raise
 
-    db.save_cached_video(cache_key, selected_video["id"])
+    db.save_cached_video(cache_key, selected_video["url"] if is_soundcloud else selected_video["id"])
 
     # lưu path thật trên máy
     song.audio_path = audio_path
