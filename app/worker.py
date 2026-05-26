@@ -29,6 +29,7 @@ class JobRunner:
             "startedAt": 0,
             "elapsedSeconds": 0,
             "doneThisRun": 0,
+            "successThisRun": 0,
             "ratePerHour": 0,
             "workers": 10,
             "logs": [],
@@ -36,6 +37,7 @@ class JobRunner:
         }
         self.seen_keys = set()
         self.export_lock = threading.Lock()
+        self.state_lock = threading.Lock()
 
     def start(
         self,
@@ -55,6 +57,7 @@ class JobRunner:
             "startedAt": time.time(),
             "elapsedSeconds": 0,
             "doneThisRun": 0,
+            "successThisRun": 0,
             "ratePerHour": 0,
             "workers": workers,
             "maxItems": max_items,
@@ -151,8 +154,9 @@ class JobRunner:
                     )
                     
                     for future in done:
+                        is_success = False
                         try:
-                            future.result()
+                            is_success = future.result()
                             del future
                             if self.state["doneThisRun"] % 100 == 0:
                                 gc.collect()
@@ -165,14 +169,19 @@ class JobRunner:
                             self.log(message)
                         except Exception as e:
                             self.log(f"He thong loi luong worker: {str(e)}")
-                        self.state["doneThisRun"] += 1
+                        
+                        with self.state_lock:
+                            self.state["doneThisRun"] += 1
+                            if is_success:
+                                self.state["successThisRun"] += 1
+                                current_success = self.state["successThisRun"]
+                            else:
+                                current_success = None
+                        
                         self.update_rate()
-                        if self.state["doneThisRun"] % 50 == 0:
-
+                        if is_success and current_success and current_success % 50 == 0:
                             cooldown = random.randint(120, 300)
-
-                            self.log(f"[Global Cooldown] sleeping={cooldown}s")
-
+                            self.log(f"[Global Cooldown] sleeping={cooldown}s (success_count={current_success})")
                             time.sleep(cooldown)
 
             self.export_sorted_jsonl(output_dir, self.state["batchId"])
@@ -254,6 +263,7 @@ class JobRunner:
 
             self.db.enqueue_sheet(song, "success", success_payload(song))
             self.log(f"Xong row {song.source_row}: {song.crawled_song_name}")
+            return True
         except Exception as error:
             message = str(error)
             if isinstance(error, YouTubeRateLimitError):
@@ -264,10 +274,11 @@ class JobRunner:
                 self.db.mark_skipped(song, message)
                 self.db.enqueue_sheet(song, "error", error_payload(song, message))
                 self.log(f"Bo qua row {song.source_row}: {message}")
-                return
+                return False
             self.db.mark_failed(song, message)
             self.db.enqueue_sheet(song, "error", error_payload(song, message))
             self.log(f"Loi row {song.source_row}: {message}")
+            return False
 
     def update_rate(self):
         elapsed = max(time.time() - self.state["startedAt"], 0.001)
