@@ -189,7 +189,7 @@ def fetch_text(url: str) -> str:
 
             # Burst cooldown
             if _request_counter % 20 == 0:
-                cooldown = random.randint(60, 120)
+                cooldown = random.randint(80, 140)
 
                 print(f"[Cooldown] Sleeping {cooldown}s")
 
