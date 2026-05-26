@@ -4,6 +4,7 @@ import re
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
+import json
 
 from .utils import parse_song_id
 
@@ -59,6 +60,75 @@ def read_shared_strings(zf: zipfile.ZipFile) -> list[str]:
         strings.append("".join(parts))
     return strings
 
+def import_input_rows(path: Path) -> list[dict]:
+
+    suffix = path.suffix.lower()
+
+    if suffix == ".xlsx":
+        return import_xlsx_rows(path)
+
+    if suffix == ".json":
+        return import_json_rows(path)
+
+    if suffix == ".jsonl":
+        return import_jsonl_rows(path)
+
+    raise ValueError(f"Unsupported input format: {suffix}")
+
+def import_json_rows(path: Path) -> list[dict]:
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    rows = []
+
+    for idx, item in enumerate(data, start=1):
+
+        song_url = item.get("song_url", "").strip()
+
+        song_id = parse_song_id(song_url)
+
+        if not song_url or not song_id:
+            continue
+
+        rows.append({
+            "source_row": idx,
+            "song_name": item.get("song_name", "").strip(),
+            "song_url": song_url,
+            "singer_name": item.get("singer_name", "").strip(),
+            "lyrics": item.get("lyrics", "").strip(),
+            "song_id": song_id,
+        })
+
+    return rows
+
+def import_jsonl_rows(path: Path) -> list[dict]:
+
+    rows = []
+
+    with open(path, "r", encoding="utf-8") as f:
+
+        for idx, line in enumerate(f, start=1):
+
+            item = json.loads(line)
+
+            song_url = item.get("song_url", "").strip()
+
+            song_id = parse_song_id(song_url)
+
+            if not song_url or not song_id:
+                continue
+
+            rows.append({
+                "source_row": idx,
+                "song_name": item.get("song_name", "").strip(),
+                "song_url": song_url,
+                "singer_name": item.get("singer_name", "").strip(),
+                "lyrics": item.get("lyrics", "").strip(),
+                "song_id": song_id,
+            })
+
+    return rows
 
 def first_sheet_path(zf: zipfile.ZipFile) -> str:
     workbook = ET.fromstring(zf.read("xl/workbook.xml"))

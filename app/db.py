@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from dataclasses import fields
 from pathlib import Path
 
 from .config import DATA_DIR, DB_PATH
@@ -34,7 +36,7 @@ class JobDB:
         with self.connect() as conn:
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS songs (
+               CREATE TABLE IF NOT EXISTS songs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_row INTEGER NOT NULL,
                     input_song_name TEXT DEFAULT '',
@@ -46,12 +48,51 @@ class JobDB:
                     crawled_singer_name TEXT DEFAULT '',
                     lyrics TEXT DEFAULT '',
                     audio_path TEXT DEFAULT '',
+
+                    batch_id INTEGER DEFAULT 0,
+
                     status TEXT DEFAULT 'pending',
                     attempt_count INTEGER DEFAULT 0,
                     error_message TEXT DEFAULT '',
                     sheet_synced INTEGER DEFAULT 0,
                     created_at TEXT DEFAULT '',
                     updated_at TEXT DEFAULT ''
+                )
+                """
+            )
+            try:
+                conn.execute(
+                    "ALTER TABLE songs ADD COLUMN batch_id INTEGER DEFAULT 0"
+                )
+            except:
+                pass
+            for ddl in (
+                "ALTER TABLE songs ADD COLUMN local_audio_path TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN lyric_path TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN duration REAL DEFAULT 0",
+                "ALTER TABLE songs ADD COLUMN sample_rate TEXT DEFAULT '44.1kHz'",
+                "ALTER TABLE songs ADD COLUMN major_genre TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN sub_genre TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN album TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN lyricist TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN composer TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN arranger TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN release_date TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN like_count TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN comment_count TEXT DEFAULT ''",
+                "ALTER TABLE songs ADD COLUMN language TEXT DEFAULT '韩语'",
+                "ALTER TABLE songs ADD COLUMN language_code TEXT DEFAULT 'ko'",
+            ):
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS youtube_cache (
+                query TEXT PRIMARY KEY,
+                video_id TEXT,
+                created_at TEXT
                 )
                 """
             )
@@ -210,7 +251,12 @@ class JobDB:
             conn.execute(
                 """
                 UPDATE songs
-                SET crawled_song_name=?, crawled_singer_name=?, lyrics=?, audio_path=?,
+                SET crawled_song_name=?, crawled_singer_name=?, lyrics=?,
+                    audio_path=?, local_audio_path=?, lyric_path=?, duration=?,
+                    sample_rate=?, major_genre=?, sub_genre=?, album=?,
+                    lyricist=?, composer=?, arranger=?, release_date=?,
+                    like_count=?, comment_count=?,
+                    language=?, language_code=?, batch_id=?,
                     status='done', error_message='', updated_at=?
                 WHERE id=?
                 """,
@@ -219,6 +265,22 @@ class JobDB:
                     song.crawled_singer_name,
                     song.lyrics,
                     song.audio_path,
+                    song.local_audio_path,
+                    song.lyric_path,
+                    float(song.duration or 0),
+                    song.sample_rate,
+                    song.major_genre,
+                    song.sub_genre,
+                    song.album,
+                    song.lyricist,
+                    song.composer,
+                    song.arranger,
+                    song.release_date,
+                    song.like_count,
+                    song.comment_count,
+                    song.language,
+                    song.language_code,
+                    song.batch_id,
                     now,
                     song.id,
                 ),
@@ -232,6 +294,26 @@ class JobDB:
                 UPDATE songs
                 SET crawled_song_name=?, crawled_singer_name=?, lyrics=?,
                     status='failed', error_message=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    song.crawled_song_name,
+                    song.crawled_singer_name,
+                    song.lyrics,
+                    error_message,
+                    now,
+                    song.id,
+                ),
+            )
+
+    def mark_skipped(self, song: SongRecord, error_message: str):
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE songs
+                SET crawled_song_name=?, crawled_singer_name=?, lyrics=?,
+                    status='skipped', error_message=?, updated_at=?
                 WHERE id=?
                 """,
                 (
@@ -328,6 +410,98 @@ class JobDB:
                 (error, now, *ids),
             )
 
+    def get_done_songs(self, batch_id: int | None = None) -> list[SongRecord]:
+        clause = "WHERE status='done'"
+        params: tuple = ()
+        if batch_id is not None:
+            clause += " AND batch_id=?"
+            params = (batch_id,)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM songs
+                {clause}
+                ORDER BY source_row ASC
+                """,
+                params,
+            ).fetchall()
+        return [self.row_to_song(row) for row in rows]
+
+    def create_new_batch(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT MAX(batch_id) AS current FROM songs").fetchone()
+        return int(row["current"] or 0) + 1
+
     @staticmethod
     def row_to_song(row: sqlite3.Row) -> SongRecord:
-        return SongRecord(**{key: row[key] for key in row.keys()})
+        allowed = {field.name for field in fields(SongRecord)}
+        return SongRecord(**{key: row[key] for key in row.keys() if key in allowed})
+
+    
+
+
+
+
+
+
+
+def get_cached_video(query):
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS youtube_cache (
+            query TEXT PRIMARY KEY,
+            video_id TEXT,
+            created_at TEXT
+            )
+            """
+        )
+
+        row = conn.execute(
+            "SELECT video_id FROM youtube_cache WHERE query = ?",
+            (query,)
+        ).fetchone()
+
+        conn.close()
+
+        if row:
+            return row[0]
+
+
+
+def save_cached_video(query, video_id):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS youtube_cache (
+        query TEXT PRIMARY KEY,
+        video_id TEXT,
+        created_at TEXT
+        )
+        """
+    )
+
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO youtube_cache
+        (query, video_id, created_at)
+        VALUES (?, ?, datetime('now'))
+        """,
+        (query, video_id)
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def create_job_db():
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if database_url:
+        from .postgres_db import PostgresJobDB
+
+        return PostgresJobDB(database_url)
+    return JobDB()
+

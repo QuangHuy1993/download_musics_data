@@ -42,7 +42,7 @@ def find_lrclib_lyrics(title: str, artist: str) -> str:
     if not best:
         return ""
 
-    lyrics = best.get("plainLyrics") or strip_lrc_timestamps(best.get("syncedLyrics", ""))
+    lyrics = best.get("syncedLyrics") or best.get("plainLyrics", "")
     return clean_lyrics(lyrics)
 
 

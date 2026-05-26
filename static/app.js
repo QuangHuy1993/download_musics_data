@@ -16,12 +16,10 @@ const startRowInput = document.getElementById("startRow");
 const endRowInput = document.getElementById("endRow");
 
 const cookieBadge = document.getElementById("cookieBadge");
-const extractChromeBtn = document.getElementById("extractChromeBtn");
-const extractEdgeBtn = document.getElementById("extractEdgeBtn");
-const extractSafariBtn = document.getElementById("extractSafariBtn");
-const extractFirefoxBtn = document.getElementById("extractFirefoxBtn");
+const autoYoutubeCookieBtn = document.getElementById("autoYoutubeCookieBtn");
 const cookiesText = document.getElementById("cookiesText");
 const saveCookiesBtn = document.getElementById("saveCookiesBtn");
+const enableAutoCookieInput = document.getElementById("enableAutoCookie");
 
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
@@ -39,9 +37,10 @@ const statDone = document.getElementById("stat-done");
 const statFailed = document.getElementById("stat-failed");
 const statPending = document.getElementById("stat-pending");
 const logsEl = document.getElementById("logs");
-
 let pollTimer = null;
 const isElectron = Boolean(window.electronAPI);
+let cookieRefreshInProgress = false;
+let lastAutoRefreshReason = "";
 
 init();
 
@@ -54,6 +53,7 @@ async function init() {
   if (saved.maxItems) maxItemsInput.value = saved.maxItems;
   if (saved.startRow) startRowInput.value = saved.startRow;
   if (saved.endRow) endRowInput.value = saved.endRow;
+  if (saved.enableAutoCookie !== undefined) enableAutoCookieInput.checked = saved.enableAutoCookie;
 
   if (isElectron) {
     // Show Electron controls and hide standard fallbacks
@@ -117,10 +117,7 @@ async function init() {
     }
   });
 
-  extractChromeBtn.addEventListener("click", () => extractBrowserCookies("chrome"));
-  extractEdgeBtn.addEventListener("click", () => extractBrowserCookies("edge"));
-  extractSafariBtn.addEventListener("click", () => extractBrowserCookies("safari"));
-  extractFirefoxBtn.addEventListener("click", () => extractBrowserCookies("firefox"));
+  autoYoutubeCookieBtn.addEventListener("click", () => refreshYouTubeCookiesFromElectron(false));
   saveCookiesBtn.addEventListener("click", saveCookies);
 
   await loadCookies();
@@ -152,10 +149,22 @@ async function selectOutputDir() {
       outputPathText.textContent = path;
       outputPathText.title = path;
       pushLog(`Đã chọn thư mục lưu nhạc: ${path}`, "info");
+      await prepareOutputDir(path);
     }
   } catch (error) {
     pushLog(`Lỗi chọn thư mục: ${error.message}`, "error");
   }
+}
+
+async function prepareOutputDir(outputDir) {
+  const result = await fetchJson("/api/prepare_output", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ outputDir })
+  });
+  const structure = result.structure || {};
+  pushLog(`Đã chuẩn bị cấu trúc PDF: ${structure.meta_path || "meta/kpop.jsonl"}`, "success");
+  return result;
 }
 
 // Import APIs
@@ -217,7 +226,8 @@ async function startJob() {
     workers: Number.parseInt(workersInput.value, 10) || 10,
     maxItems: Number.parseInt(maxItemsInput.value, 10) || 0,
     startRow: Number.parseInt(startRowInput.value, 10) || 0,
-    endRow: Number.parseInt(endRowInput.value, 10) || 0
+    endRow: Number.parseInt(endRowInput.value, 10) || 0,
+    enableAutoCookie: enableAutoCookieInput.checked
   };
 
   if (prefs.startRow && prefs.endRow && prefs.startRow > prefs.endRow) {
@@ -233,6 +243,12 @@ async function startJob() {
 
   setBusy(true);
   try {
+    await prepareOutputDir(outputDir);
+
+    if (isElectron && !cookiesText.value.trim()) {
+      await refreshYouTubeCookiesFromElectron(true);
+    }
+
     if (prefs.sheetApiUrl && prefs.sheetToken) {
       await fetchJson("/api/configure_sheet", {
         method: "POST",
@@ -304,10 +320,11 @@ function renderStatus(data) {
   const total = Number(stats.total || 0);
   const done = Number(stats.done || 0);
   const failed = Number(stats.failed || 0);
+  const skipped = Number(stats.skipped || 0);
   const pending = Number(stats.pending || 0);
   const running = Number(stats.running || 0);
   const pausedYoutube = Number(stats.paused_youtube || 0);
-  const completed = done + failed;
+  const completed = done + failed + skipped;
 
   // Header status banner
   if (runner.running) {
@@ -324,17 +341,29 @@ function renderStatus(data) {
   
   // Stats grid badges
   statDone.textContent = done;
-  statFailed.textContent = failed;
+  statFailed.textContent = skipped ? `${failed} lỗi · ${skipped} bỏ qua` : failed;
   statPending.textContent = pending + running + pausedYoutube;
 
   // Append new logs in console
   const logsList = runner.logs || [];
+  maybeAutoRefreshCookiesAndResume(runner);
+
   if (logsList.length > 0) {
     logsEl.innerHTML = "";
     for (const item of logsList.slice().reverse()) {
       const li = document.createElement("li");
       const timeStr = new Date(item.time * 1000).toLocaleTimeString("vi-VN", { hour12: false });
-      li.textContent = `[${timeStr}] ${item.message}`;
+      const timeEl = document.createElement("span");
+      timeEl.className = "log-time";
+      timeEl.textContent = `[${timeStr}]`;
+
+      const messageEl = document.createElement("span");
+      messageEl.className = "log-message";
+      messageEl.textContent = item.message;
+
+      li.append(timeEl, messageEl);
+      li.title = "Bấm để copy dòng này";
+      li.addEventListener("click", () => copyLogLine(`[${timeStr}] ${item.message}`));
       
       // Syntax coloring for logs
       if (item.message.toLowerCase().includes("lỗi") || item.message.toLowerCase().includes("failed") || item.message.toLowerCase().includes("error")) {
@@ -348,6 +377,50 @@ function renderStatus(data) {
       }
       logsEl.appendChild(li);
     }
+  }
+}
+
+async function copyLogLine(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_error) {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  }
+}
+
+function isYouTubeCookieProblem(message) {
+  const text = String(message || "").toLowerCase();
+  return (
+    text.includes("cookie") ||
+    text.includes("sign in") ||
+    text.includes("login") ||
+    text.includes("not a bot") ||
+    text.includes("verify") ||
+    text.includes("xác minh")
+  );
+}
+
+async function maybeAutoRefreshCookiesAndResume(runner) {
+  const reason = runner.pausedReason || "";
+  if (!isElectron || !reason || cookieRefreshInProgress) return;
+  if (!enableAutoCookieInput.checked) return; // Only auto refresh if checked
+  if (!isYouTubeCookieProblem(reason)) return;
+  if (lastAutoRefreshReason === reason) return;
+
+  lastAutoRefreshReason = reason;
+  pushLog("YouTube yêu cầu xác minh/cookie mới. App sẽ tự mở YouTube để làm mới cookie rồi chạy tiếp.", "warning");
+  try {
+    await refreshYouTubeCookiesFromElectron(true);
+    await startJob();
+  } catch (error) {
+    pushLog(`Không thể tự làm mới cookie: ${error.message}`, "error");
   }
 }
 
@@ -391,6 +464,51 @@ async function saveCookies() {
   }
 }
 
+async function refreshYouTubeCookiesFromElectron(autoMode) {
+  if (!isElectron || !window.electronAPI.refreshYouTubeCookies) {
+    if (!autoMode) {
+      pushLog("Chức năng YouTube Auto chỉ dùng được trong bản app Electron.", "warning");
+    }
+    return false;
+  }
+
+  cookieRefreshInProgress = true;
+  setBusy(true);
+  pushLog(
+    autoMode
+      ? "Đang tự làm mới YouTube cookie từ session của app..."
+      : "Đang mở YouTube trong app để lấy cookie. Nếu chưa đăng nhập, hãy đăng nhập trong cửa sổ vừa mở.",
+    "warning"
+  );
+
+  try {
+    const result = await window.electronAPI.refreshYouTubeCookies();
+    if (!result.ok || !result.cookies) {
+      throw new Error(result.message || "Không lấy được cookie YouTube.");
+    }
+
+    await fetchJson("/api/save_cookies", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cookies: result.cookies })
+    });
+
+    cookiesText.value = result.cookies;
+    updateCookieBadge(result.cookies);
+    pushLog(result.message || "Đã làm mới YouTube cookie.", "success");
+    return true;
+  } catch (error) {
+    pushLog(`Lỗi làm mới YouTube cookie: ${error.message}`, "error");
+    if (autoMode) {
+      throw error;
+    }
+    return false;
+  } finally {
+    cookieRefreshInProgress = false;
+    setBusy(false);
+  }
+}
+
 async function extractBrowserCookies(browserName) {
   setBusy(true);
   pushLog(`Đang trích xuất cookies từ trình duyệt ${browserName.toUpperCase()} (vui lòng chờ)...`, "warning");
@@ -429,10 +547,7 @@ function fileToBase64(file) {
 
 function setBusy(isBusy) {
   startBtn.disabled = isBusy;
-  extractChromeBtn.disabled = isBusy;
-  extractEdgeBtn.disabled = isBusy;
-  extractSafariBtn.disabled = isBusy;
-  extractFirefoxBtn.disabled = isBusy;
+  autoYoutubeCookieBtn.disabled = isBusy;
   saveCookiesBtn.disabled = isBusy;
   resetDbBtn.disabled = isBusy;
 }

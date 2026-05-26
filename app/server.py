@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import shutil
+import subprocess
 import tempfile
 import urllib.parse
 import uuid
@@ -11,17 +12,55 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .config import DATA_DIR, DEFAULT_OUTPUT_DIR, HOST, PORT, STATIC_DIR
-from .db import JobDB
-from .excel_importer import import_xlsx_rows
+from .db import create_job_db
+from .excel_importer import import_input_rows
 from .google_sheet import SheetSyncer
+from .jsonl_exporter import ensure_delivery_structure
 from .utils import clamp_int
 from .worker import JobRunner
-from .downloader import extract_browser_cookies
 
 
-DB = JobDB()
+DB = create_job_db()
 SHEET_SYNCER = SheetSyncer(DB)
 RUNNER = JobRunner(DB, SHEET_SYNCER)
+
+
+def extract_browser_cookies(browser: str) -> tuple[bool, str]:
+    yt_dlp = shutil.which("yt-dlp")
+    if not yt_dlp:
+        return False, "Không tìm thấy yt-dlp trong PATH."
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cookie_file = DATA_DIR / "cookies.txt"
+    command = [
+        yt_dlp,
+        "--cookies-from-browser",
+        browser,
+        "--cookies",
+        str(cookie_file),
+        "--skip-download",
+        "--simulate",
+        "https://www.youtube.com/",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+    except Exception as error:
+        return False, f"Lỗi lấy cookie từ {browser}: {error}"
+
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "").strip()
+        return False, message or f"yt-dlp không lấy được cookie từ {browser}."
+
+    if not cookie_file.exists():
+        return False, "yt-dlp chạy xong nhưng chưa tạo data/cookies.txt."
+
+    return True, f"Đã lưu cookie vào {cookie_file}"
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -74,7 +113,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 excel_path = Path(payload.get("path")).expanduser()
                 if not excel_path.exists():
                     raise FileNotFoundError(f"Không tìm thấy file Excel tại đường dẫn: {excel_path}")
-                rows = import_xlsx_rows(excel_path)
+                rows = import_input_rows(excel_path)
                 result = DB.import_rows(rows)
                 self.write_json({"ok": True, "rows": len(rows), **result, "stats": DB.stats()})
                 return
@@ -84,9 +123,16 @@ class AppHandler(BaseHTTPRequestHandler):
                 SHEET_SYNCER.start()
                 self.write_json({"ok": True})
                 return
+            if parsed.path == "/api/prepare_output":
+                payload = self.read_json()
+                output_dir = Path(payload.get("outputDir") or DEFAULT_OUTPUT_DIR).expanduser()
+                structure = ensure_delivery_structure(output_dir)
+                self.write_json({"ok": True, "structure": structure})
+                return
             if parsed.path == "/api/start":
                 payload = self.read_json()
                 output_dir = Path(payload.get("outputDir") or DEFAULT_OUTPUT_DIR).expanduser()
+                ensure_delivery_structure(output_dir)
                 workers = clamp_int(payload.get("workers"), default=10, minimum=1, maximum=16)
                 max_items = clamp_int(payload.get("maxItems"), default=0, minimum=0, maximum=1000000)
                 start_row = clamp_int(payload.get("startRow"), default=0, minimum=0, maximum=10000000)
@@ -145,7 +191,7 @@ class AppHandler(BaseHTTPRequestHandler):
             tmp.write(raw)
             tmp_path = Path(tmp.name)
         try:
-            rows = import_xlsx_rows(tmp_path)
+            rows = import_input_rows(tmp_path)
             result = DB.import_rows(rows)
             self.write_json({"ok": True, "rows": len(rows), **result, "stats": DB.stats()})
         finally:
@@ -192,7 +238,18 @@ def main():
     server = ThreadingHTTPServer((HOST, PORT), AppHandler)
     print(f"Melon Music Downloader dang chay: http://{HOST}:{PORT}", flush=True)
     print("Nhan Ctrl+C de dung server.", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Dang dung server...", flush=True)
+    finally:
+        RUNNER.stop()
+        SHEET_SYNCER.stop()
+        server.server_close()
+        close_db = getattr(DB, "close", None)
+        if callable(close_db):
+            close_db()
+        print("Server da dung.", flush=True)
 
 
 if __name__ == "__main__":

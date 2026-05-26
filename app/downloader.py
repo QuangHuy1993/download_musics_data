@@ -7,12 +7,41 @@ import time
 import unicodedata
 import re
 import sys
-import ssl
-import urllib.request
-import urllib.parse
 import random
 import threading
+import app.db as db
+
 from pathlib import Path
+from .utils import sanitize_path
+
+
+
+class YouTubeRateLimitError(Exception):
+    pass 
+
+
+class _YtdlpQuietLogger:
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
+
+# Prefer yt_dlp but be tolerant if import style differs.
+try:
+    from yt_dlp import YoutubeDL
+except Exception:
+    try:
+        import yt_dlp as _yt_dlp
+        YoutubeDL = _yt_dlp.YoutubeDL
+    except Exception as exc:
+        raise ImportError(
+            "yt_dlp is required by app.downloader. Install with: pip install yt-dlp"
+        ) from exc
 
 from .config import (
     DATA_DIR,
@@ -23,488 +52,402 @@ from .config import (
     YOUTUBE_RATE_LIMIT_PAUSE_SECONDS,
 )
 
-def get_ytdlp_path() -> str:
-    configured = os.environ.get("YTDLP_PATH", "").strip()
-    if configured and Path(configured).exists():
-        return configured
+# Minimal, robust downloader utilities
 
-    bin_dir = os.environ.get("MELON_BIN_DIR", "").strip()
-    interpreter_dir = Path(sys.executable).parent
-    binary_name = "yt-dlp.exe" if sys.platform == "win32" else "yt-dlp"
-
-    if bin_dir:
-        bundled_ytdlp = Path(bin_dir) / binary_name
-        if bundled_ytdlp.exists():
-            return str(bundled_ytdlp)
-
-    local_ytdlp = interpreter_dir / binary_name
-    if local_ytdlp.exists():
-        return str(local_ytdlp)
-    found = shutil.which("yt-dlp")
-    if found:
-        return found
-    return "yt-dlp"
-from .models import SongRecord
-from .utils import sanitize_path
-
-
-class YouTubeRateLimitError(RuntimeError):
-    pass
-
-
-_YOUTUBE_SEMAPHORE = threading.BoundedSemaphore(max(1, YOUTUBE_DOWNLOAD_WORKERS))
-_youtube_lock = threading.Lock()
-_youtube_next = 0.0
-_youtube_pause_until = 0.0
-_youtube_rate_limited = False
-
-
-def download_original_audio(song: SongRecord, output_dir: Path) -> SongRecord:
-    folder_name = sanitize_path(f"{song.crawled_song_name} - {song.crawled_singer_name} [{song.song_id}]")
-    file_name = sanitize_path(f"{song.crawled_song_name} - {song.crawled_singer_name} [{song.song_id}]")
-    song_dir = output_dir / folder_name
-    temp_dir = output_dir / ".tmp" / f"{song.song_id}-{int(time.time() * 1000)}"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        song.audio_path = try_download_queries(song, temp_dir, file_name)
-        if not song.audio_path:
-            raise RuntimeError("yt-dlp ket thuc nhung khong tim thay file audio da tai.")
-
-        if song_dir.exists():
-            shutil.rmtree(song_dir)
-        song_dir.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = Path(song.audio_path)
-        shutil.move(str(temp_dir), str(song_dir))
-        song.audio_path = str(song_dir / temp_path.name)
-        return song
-    except Exception:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        raise
-    finally:
-        remove_empty_dir(temp_dir.parent)
-
-
-def find_youtube_videos(song_name: str, artist_name: str, max_results: int = 5) -> list[str]:
-    """
-    Trả về danh sách tối đa max_results video IDs phù hợp.
-    Danh sách ưu tiên: strict match trước, fallback sau.
-    Trả về nhiều kết quả để try_download_queries có thể thử từng cái khi
-    gặp video bị age-restrict hoặc không tải được.
-    """
-    clean_artist = re.sub(r'[\(\[\{].*?[\)\]\}]', ' ', artist_name)
-    clean_artist = " ".join(clean_artist.split()).strip()
-
-    title_clean = song_name.replace("19금", "").strip()
-
-    query = f"{title_clean} {clean_artist}"
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    context = ssl._create_unverified_context()
-
-    norm_song = re.sub(r'\s+', '', title_clean.lower())
-    norm_artist = re.sub(r'\s+', '', clean_artist.lower())
-    is_inst = any(kw in title_clean.lower() for kw in ("instrumental", "inst", "반주", "mr"))
-
-    url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
-    req = urllib.request.Request(url, headers=headers)
-
-    try:
-        with urllib.request.urlopen(req, timeout=10, context=context) as response:
-            html = response.read().decode("utf-8", errors="ignore")
-    except Exception:
-        return []
-
-    blocks = html.split('"videoRenderer":')
-    if len(blocks) <= 1:
-        return []
-
-    strict_ids: list[str] = []
-    fallback_ids: list[str] = []
-
-    for block in blocks[1:15]:   # scan top 15 để có đủ candidates
-        id_match = re.search(r'"videoId"\s*:\s*"([^"]+)"', block)
-        if not id_match:
-            continue
-        video_id = id_match.group(1)
-
-        title_match = re.search(r'"title"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"([^"]+)"', block)
-        video_title = title_match.group(1) if title_match else ""
-        try:
-            video_title = video_title.encode('utf-8').decode('unicode_escape', errors='ignore')
-        except Exception:
-            pass
-
-        channel_match = re.search(r'"ownerText"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"([^"]+)"', block)
-        channel_name = ""
-        if channel_match:
-            channel_name = channel_match.group(1)
-            try:
-                channel_name = channel_name.encode('utf-8').decode('unicode_escape', errors='ignore')
-            except Exception:
-                pass
-
-        length_match = re.search(r'"lengthText"\s*:\s*\{\s*"simpleText"\s*:\s*"([^"]+)"', block)
-        length_str = length_match.group(1) if length_match else ""
-        duration_sec = 0
-        if length_str:
-            parts = length_str.split(":")
-            try:
-                if len(parts) == 2:
-                    duration_sec = int(parts[0]) * 60 + int(parts[1])
-                elif len(parts) == 3:
-                    duration_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-            except ValueError:
-                pass
-
-        norm_v_title = re.sub(r'\s+', '', video_title.lower())
-        norm_channel = re.sub(r'\s+', '', channel_name.lower())
-
-        # Hard filters (bất kể strict hay fallback)
-        if duration_sec > 600 or (0 < duration_sec < 45):
-            continue
-        if "cover" in norm_v_title and "cover" not in norm_song:
-            continue
-        if "karaoke" in norm_v_title and "karaoke" not in norm_song:
-            continue
-        if "tj" in norm_channel or "금영" in norm_v_title:
-            continue
-        if not is_inst and ("inst" in norm_v_title or "instrumental" in norm_v_title or "반주" in norm_v_title) and "inst" not in norm_song:
-            continue
-
-        # Strict match: cả tên bài lẫn nghệ sĩ đều có
-        has_song = norm_song in norm_v_title or any(
-            part in norm_v_title
-            for part in re.split(r'[^a-zA-Z0-9가-힣]', title_clean.lower()) if len(part) > 2
+def _is_youtube_auth_error(error: Exception | str) -> bool:
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "sign in",
+            "login",
+            "cookie",
+            "cookies",
+            "confirm you're not a bot",
+            "not a bot",
+            "verify",
+            "verification",
+            "403",
+            "429",
         )
-        has_artist = (
-            norm_artist in norm_v_title
-            or norm_artist in norm_channel
-            or any(
-                part in norm_v_title or part in norm_channel
-                for part in re.split(r'[^a-zA-Z0-9가-힣]', clean_artist.lower()) if len(part) > 2
-            )
-        )
-
-        if has_song and (has_artist or "topic" in norm_channel):
-            if video_id not in strict_ids:
-                strict_ids.append(video_id)
-        else:
-            if video_id not in fallback_ids:
-                fallback_ids.append(video_id)
-
-        if len(strict_ids) >= max_results:
-            break
-
-    # Strict match ưu tiên, sau đó mới fallback
-    candidates = strict_ids + fallback_ids
-    return candidates[:max_results]
-
-
-def find_youtube_video(song_name: str, artist_name: str) -> str | None:
-    """Legacy wrapper — trả về video ID đầu tiên hoặc None."""
-    results = find_youtube_videos(song_name, artist_name, max_results=1)
-    return results[0] if results else None
-
-
-# Từ khoá trong lỗi yt-dlp cho biết video bị chặn/hạn chế cụ thể.
-# Phải đủ chính xác để không nhầm với lỗi mạng/timeout.
-_SKIP_ERROR_KEYWORDS = (
-    "sign in to confirm",         # age-restricted
-    "age-restricted",              # age-restricted (dạng khác)
-    "private video",               # video riêng tư
-    "video unavailable",           # video không tồn tại
-    "this video has been removed", # đã bị xóa
-    "requested format is not available",  # format không tồn tại trên video này
-    "no video formats found",      # không có format nào
-    "members-only",                # video chỉ dành cho thành viên
-    "copyright",                   # bị chặn do bản quyền
-)
-
-_RATE_LIMIT_KEYWORDS = (
-    "rate-limited by youtube",
-    "current session has been rate-limited",
-    "try again later",
-    "too many requests",
-    "http error 429",
-)
-
-
-def _is_skippable_error(error: str) -> bool:
-    """Trả về True nếu lỗi là do video bị chặn/hạn chế (nên thử video khác)."""
-    if _is_youtube_rate_limited(error):
-        return False
-    lower = error.lower()
-    return any(kw in lower for kw in _SKIP_ERROR_KEYWORDS)
-
-
-def try_download_queries(song: SongRecord, temp_dir: Path, file_name: str) -> str:
-    with _YOUTUBE_SEMAPHORE:
-        if is_youtube_rate_limited():
-            raise YouTubeRateLimitError(rate_limit_message("YouTube dang bi rate-limit."))
-        _wait_youtube_turn()
-        # Lấy tối đa 5 video candidates thay vì 1
-        video_ids = find_youtube_videos(song.crawled_song_name, song.crawled_singer_name, max_results=5)
-        if not video_ids:
-            raise RuntimeError("Khong tim thay video phu hop tren YouTube.")
-
-        last_error = ""
-        for video_id in video_ids:
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
-            clear_audio_files(temp_dir)
-            _wait_youtube_turn()
-            audio_path, error = run_ytdlp(video_url, temp_dir, file_name)
-            if audio_path:
-                return audio_path
-            last_error = error
-            if _is_youtube_rate_limited(error):
-                _pause_youtube_downloads()
-                raise YouTubeRateLimitError(rate_limit_message(error))
-            # Nếu lỗi do video bị age-restrict / private / bị xóa → thử video tiếp
-            if _is_skippable_error(error):
-                continue
-            # Lỗi khác (timeout, mạng…) → dừng ngay, không thử tiếp
-            break
-
-    raise RuntimeError(last_error or "Khong tai duoc audio tu bat ky video nao.")
-
-
-def _wait_youtube_turn():
-    global _youtube_next
-    while True:
-        with _youtube_lock:
-            if _youtube_rate_limited:
-                raise YouTubeRateLimitError(rate_limit_message("YouTube dang bi rate-limit."))
-            now = time.monotonic()
-            wait = max(_youtube_pause_until, _youtube_next) - now
-            if wait <= 0:
-                delay = random.uniform(YOUTUBE_DELAY_MIN_SECONDS, YOUTUBE_DELAY_MAX_SECONDS)
-                _youtube_next = now + delay
-                return
-        time.sleep(min(wait, 5.0))
-
-
-def _pause_youtube_downloads():
-    global _youtube_pause_until, _youtube_rate_limited
-    with _youtube_lock:
-        _youtube_rate_limited = True
-        _youtube_pause_until = max(
-            _youtube_pause_until,
-            time.monotonic() + YOUTUBE_RATE_LIMIT_PAUSE_SECONDS,
-        )
-
-
-def is_youtube_rate_limited() -> bool:
-    with _youtube_lock:
-        return _youtube_rate_limited
-
-
-def rate_limit_message(detail: str) -> str:
-    return (
-        "YOUTUBE_RATE_LIMIT: YouTube da gioi han session hien tai. "
-        "Tool da tam dung queue YouTube. Hay doi cookie YouTube hoac cho khoang "
-        f"{int(YOUTUBE_RATE_LIMIT_PAUSE_SECONDS / 60)} phut roi bam Start/Resume lai. "
-        f"Chi tiet: {detail}"
     )
 
-
-def _is_youtube_rate_limited(error: str) -> bool:
-    lower = str(error or "").lower()
-    return any(keyword in lower for keyword in _RATE_LIMIT_KEYWORDS)
-
-
-def normalize_query_text(value: str) -> str:
-    value = unicodedata.normalize("NFKC", value or "")
-    return " ".join(value.split())
+def _normalize_search_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value or "").lower()
+    value = re.sub(r"\bofficial\s+audio\b", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\btopic\b", " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"[\[\](){}'\"`~!@#$%^&*_+=|\\/:;,.?<>-]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
 
 
-def simplify_title(value: str) -> str:
-    simplified = value
-    for phrase in ("Explicit Ver.", "Edited Ver.", "Original Karaoke", "Instrumental Rock Version"):
-        simplified = simplified.replace(phrase, "")
-    simplified = re.sub(r"[\[\]()]+", " ", simplified)
-    simplified = re.sub(r"\s+", " ", simplified)
-    return simplified.strip(" -:")
+def _unique_search_queries(title: str, artist: str) -> list[str]:
+    title = re.sub(r"\s+", " ", title or "").strip()
+    artist = re.sub(r"\s+", " ", artist or "").strip()
+    candidates = [
+        f"{title} {artist} official audio",
+        f"{title} {artist}",
+        f"{title} {artist} Topic",
+        title,
+    ]
 
-
-def unique_values(values: list[str]) -> list[str]:
-    seen = set()
-    result = []
-    for value in values:
-        key = value.casefold()
-        if key not in seen:
+    seen: set[str] = set()
+    queries: list[str] = []
+    for candidate in candidates:
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        key = candidate.lower()
+        if candidate and key not in seen:
+            queries.append(candidate)
             seen.add(key)
-            result.append(value)
-    return result
+    return queries
 
 
-def run_ytdlp(query: str, temp_dir: Path, file_name: str, cookies_browser: str = None) -> tuple[str, str]:
-    output_template = str(temp_dir / f"{file_name}.%(ext)s")
-    # Format priority:
-    # 1. m4a audio-only (fastest, no ffmpeg needed)
-    # 2. Any best audio-only stream (webm/opus etc, ffmpeg converts to m4a)
-    # 3. Worst case: audio-only from video container — still avoid full video
-    # We do NOT fall back to video formats (best[ext=mp4]/best) because that
-    # downloads several hundred MB of video unnecessarily and hangs.
-    cmd = [
-        get_ytdlp_path(),
-        query,
-        "-f",
-        "bestaudio[ext=m4a]/bestaudio[acodec!=none]/bestaudio",
-        "-x",
-        "--audio-format",
-        "m4a",
-        "--audio-quality",
-        "0",
-        "--no-check-certificates",
-        "--js-runtimes",
-        "node",
-        "--concurrent-fragments",
-        "1",
-        "--sleep-requests",
-        "1.5",
-        "--sleep-interval",
-        str(YOUTUBE_DELAY_MIN_SECONDS),
-        "--max-sleep-interval",
-        str(YOUTUBE_DELAY_MAX_SECONDS),
-        "--socket-timeout",
-        "15",
-        "--retries",
-        "1",
-        "--fragment-retries",
-        "1",
-        "--extractor-retries",
-        "1",
-        "--match-filter",
-        "!is_live",
-        "--no-part",
-        "--ignore-errors",
-        "--no-abort-on-error",
-        "--max-downloads",
-        "1",
-        "--no-simulate",
-        "--print",
-        "after_move:filepath",
-        "-o",
-        output_template,
-    ]
-    if cookies_browser:
-        cmd.extend(["--cookies-from-browser", cookies_browser])
-        # Also cache them to data/cookies.txt for future speedup!
-        cookie_file = DATA_DIR / "cookies.txt"
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        cmd.extend(["--cookies", str(cookie_file)])
+def _score_youtube_candidate(video: dict, title: str, artist: str) -> int:
+    expected_title = _normalize_search_text(title)
+    expected_artist = _normalize_search_text(artist)
+    video_title = _normalize_search_text(str(video.get("title") or ""))
+    uploader = _normalize_search_text(
+        str(video.get("uploader") or video.get("channel") or video.get("channel_id") or "")
+    )
+    haystack = f"{video_title} {uploader}"
+
+    score = 0
+    if expected_title and expected_title in video_title:
+        score += 60
     else:
-        cookie_file = DATA_DIR / "cookies.txt"
-        if cookie_file.exists() and cookie_file.stat().st_size > 0:
-            cmd.extend(["--cookies", str(cookie_file)])
+        title_tokens = [token for token in expected_title.split() if len(token) >= 2]
+        if title_tokens:
+            matched = sum(1 for token in title_tokens if token in video_title)
+            score += int(45 * matched / len(title_tokens))
 
-    stdout_buf: list[str] = []
-    stderr_buf: list[str] = []
-    proc = None
-    try:
-        # Use Popen instead of run() so that we can kill child processes
-        # (including ffmpeg spawned by yt-dlp) on timeout, preventing zombie hangs.
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        try:
-            stdout_data, stderr_data = proc.communicate(timeout=YTDLP_TIMEOUT_SECONDS)
-            stdout_buf.append(stdout_data or "")
-            stderr_buf.append(stderr_data or "")
-        except subprocess.TimeoutExpired:
-            # Kill the entire process group so ffmpeg subprocesses are also terminated
-            proc.kill()
-            proc.communicate()  # Drain pipes to prevent deadlock
-            raise RuntimeError(f"yt-dlp timeout {YTDLP_TIMEOUT_SECONDS}s")
-    finally:
-        if proc and proc.poll() is None:
-            proc.kill()
+    if expected_artist and expected_artist in haystack:
+        score += 25
+    else:
+        artist_tokens = [token for token in expected_artist.split() if len(token) >= 2]
+        if artist_tokens:
+            matched = sum(1 for token in artist_tokens if token in haystack)
+            score += int(18 * matched / len(artist_tokens))
 
-    discovered = find_audio_file(temp_dir)
-    if discovered:
-        return str(discovered), ""
+    if "official audio" in str(video.get("title") or "").lower():
+        score += 8
+    if "topic" in str(video.get("channel") or video.get("uploader") or "").lower():
+        score += 8
 
-    stdout_text = "".join(stdout_buf)
-    stderr_text = "".join(stderr_buf)
-    output = clean_process_output(stderr_text + "\n" + stdout_text)
-    if proc.returncode != 0:
-        return "", output or f"yt-dlp loi voi query: {query}"
-    return "", f"Khong co file audio sau khi chay query: {query}\n{output}".strip()
+    duration = video.get("duration")
+    if isinstance(duration, (int, float)) and 45 <= duration <= 900:
+        score += 5
+
+    source_text = f"{video.get('title') or ''} {video.get('description') or ''}"
+    text = source_text.lower()
+    normalized_text = f" {_normalize_search_text(source_text)} "
+    normalized_expected = f" {_normalize_search_text(title)} "
+    if any(bad in text for bad in ("cover", "karaoke", "reaction", "live cam")):
+        score -= 20
+    if not any(marker in normalized_expected for marker in (" inst ", " instrumental ", " mr ", " 반주 ")):
+        if any(marker in normalized_text for marker in (" inst ", " instrumental ", " mr ", " 반주 ")):
+            score -= 40
+
+    return score
 
 
-def extract_browser_cookies(browser_name: str) -> tuple[bool, str]:
+def _youtube_cache_key(title: str, artist: str) -> str:
+    return f"audio-only-v2::{title}::{artist}".strip(":")
+
+
+def search_youtube_candidates(title: str, artist: str = "", max_results: int = 12, use_cookies: bool = True) -> list[dict]:
+    candidates_by_id: dict[str, tuple[int, dict]] = {}
+
+    ydl_opts = {
+        "quiet": True,
+        "noprogress": True,
+        "logger": _YtdlpQuietLogger(),
+        "skip_download": True,
+        "default_search": "ytsearch",
+        "noplaylist": True,
+        "extract_flat": True,
+        "ignoreerrors": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
     cookie_file = DATA_DIR / "cookies.txt"
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # We run a dummy query with --skip-download to dump cookies
-    cmd = [
-        get_ytdlp_path(),
-        "--cookies-from-browser",
-        browser_name,
-        "--cookies",
-        str(cookie_file),
-        "--skip-download",
-        "--no-check-certificates",
-        "--remote-components",
-        "ejs:github",
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    ]
+    if use_cookies and cookie_file.exists():
+        ydl_opts["cookiefile"] = str(cookie_file)
+
     try:
-        result = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=30,
-        )
-        if cookie_file.exists() and cookie_file.stat().st_size > 0:
-            return True, f"Trích xuất thành công {cookie_file.stat().st_size} bytes cookie từ {browser_name}."
-        
-        output = (result.stderr or "") + "\n" + (result.stdout or "")
-        return False, f"Không thể trích xuất cookie từ {browser_name}. Chi tiết:\n{output}"
+        with YoutubeDL(ydl_opts) as ydl:
+            for query in _unique_search_queries(title, artist):
+                search_query = f"ytsearch8:{query}"
+                print(f"[YT SEARCH] {search_query}")
+                info = ydl.extract_info(search_query, download=False)
+                entries = (info or {}).get("entries") or []
+                for video in entries:
+                    if not video or not video.get("id"):
+                        continue
+                    score = _score_youtube_candidate(video, title, artist)
+                    video_id = video["id"]
+                    current = candidates_by_id.get(video_id)
+                    if current is None or score > current[0]:
+                        candidates_by_id[video_id] = (score, video)
     except Exception as e:
-        return False, f"Lỗi chạy lệnh trích xuất: {str(e)}"
+        if use_cookies and cookie_file.exists():
+            print(f"YouTube search failed with cookies, retrying without cookies: {e}")
+            return search_youtube_candidates(title, artist, max_results, use_cookies=False)
+        print(f"YouTube search failed: {e}")
+        if _is_youtube_auth_error(e):
+            raise YouTubeRateLimitError(
+                f"YouTube yeu cau cookie/xac minh moi khi search: {e}"
+            ) from e
+        return []
+
+    ranked = sorted(candidates_by_id.values(), key=lambda item: item[0], reverse=True)
+    return [
+        {
+            "id": video.get("id"),
+            "title": video.get("title"),
+            "url": f"https://www.youtube.com/watch?v={video.get('id')}",
+            "score": score,
+        }
+        for score, video in ranked[:max_results]
+        if video.get("id")
+    ]
 
 
-def clean_process_output(value: str) -> str:
-    lines = [line.strip() for line in str(value or "").splitlines() if line.strip()]
-    return "\n".join(lines[-8:])
+def search_youtube_video(title: str, artist: str = ""):
+    cache_key = _youtube_cache_key(title, artist)
+
+    # Check cache first
+    cached_video_id = db.get_cached_video(cache_key)
+
+    if cached_video_id:
+        return {
+            "id": cached_video_id,
+            "title": title,
+            "url": f"https://www.youtube.com/watch?v={cached_video_id}"
+        }
+
+    candidates = search_youtube_candidates(title, artist, max_results=1)
+    return candidates[0] if candidates else None
 
 
-def to_text(value) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return str(value or "")
+def _ensure_dir(path: str) -> None:
+    Path(path).mkdir(parents=True, exist_ok=True)
 
+def _sanitize_filename(name: str) -> str:
+    # Basic sanitization to produce filesystem-safe names
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode("ascii")
+    name = re.sub(r"[<>:\"/\\|?*\n\r\t]+", "_", name)
+    name = name.strip()
+    return name or "download"
 
-def find_audio_file(song_dir: Path) -> Path | None:
-    candidates = []
-    for suffix in (".m4a", ".webm", ".opus", ".mp3", ".aac"):
-        candidates.extend(song_dir.glob(f"*{suffix}"))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+def download_url(url: str, output_stem: Path, timeout: int | None = None, use_cookies: bool = True) -> tuple[str, dict]:
+    """
+    Download a single URL as m4a audio-only.
+    """
+    timeout = timeout or YTDLP_TIMEOUT_SECONDS
+    output_stem.parent.mkdir(parents=True, exist_ok=True)
 
+    outtmpl = str(output_stem.with_suffix(".%(ext)s"))
 
-def clear_audio_files(song_dir: Path):
-    for path in song_dir.iterdir():
-        if path.is_file() and path.suffix.lower() in {".m4a", ".webm", ".opus", ".mp3", ".aac"}:
-            path.unlink(missing_ok=True)
+    base_opts = {
+        "outtmpl": outtmpl,
 
+        "noplaylist": True,
+        "quiet": True,
+        "noprogress": True,
+        "logger": _YtdlpQuietLogger(),
+        "no_warnings": True,
+        "skip_download": False,
+        "format": "bestaudio[ext=m4a]/bestaudio[acodec!=none]/bestaudio",
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "m4a",
+                "preferredquality": "0",
+            }
+        ],
 
-def remove_empty_dir(path: Path):
+        "socket_timeout": timeout,
+
+        "sleep_interval_requests": 0.5,
+        "max_sleep_interval": 2,
+
+        "concurrent_fragment_downloads": 1,
+
+        "retries": 1,
+
+        "fragment_retries": 1,
+        "extractor_retries": 1,
+
+        "http_chunk_size": 10485760,
+        "http_headers": {
+        "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+        )
+        },
+
+    }
+    cookie_opts = {}
+    cookie_file = DATA_DIR / "cookies.txt"
+    if use_cookies and cookie_file.exists():
+        cookie_opts["cookiefile"] = str(cookie_file)
+
+    last_error = None
+
+    ydl_opts = {**base_opts, **cookie_opts}
     try:
-        path.rmdir()
-    except OSError:
-        pass
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            requested = info.get("requested_downloads") or []
+            if requested and requested[0].get("filepath"):
+                filepath = Path(requested[0]["filepath"])
+                m4a_path = filepath.with_suffix(".m4a")
+                if m4a_path.exists():
+                    return str(m4a_path), info
+                if filepath.exists() and filepath.suffix.lower() in {".m4a", ".webm", ".opus", ".mp3", ".aac"}:
+                    return str(filepath), info
+            matches = sorted(
+                [
+                    path
+                    for path in output_stem.parent.glob(f"{output_stem.name}.*")
+                    if path.suffix.lower() in {".m4a", ".webm", ".opus", ".mp3", ".aac"}
+                ],
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            if matches:
+                return str(matches[0]), info
+            raise RuntimeError("yt-dlp finished but no audio output file was found")
+    except Exception as exc:
+        if use_cookies and cookie_file.exists():
+            print(f"Failed to download with cookies, retrying without cookies: {exc}")
+            return download_url(url, output_stem, timeout, use_cookies=False)
+
+        last_error = exc
+        if _is_youtube_auth_error(exc):
+            raise YouTubeRateLimitError(
+                f"YouTube yeu cau cookie/xac minh moi khi download: {exc}"
+            ) from exc
+
+    raise RuntimeError(f"Failed to download {url}: {last_error}") from last_error
+
+# Simple rate-limited downloader loop for a list of URLs
+def download_many(urls: list[str], dest_dir: str | None = None) -> list[str]:
+    results: list[str] = []
+    dest_dir = dest_dir or DATA_DIR
+    for i, url in enumerate(urls):
+
+        if i > 0 and i % 20 == 0:
+
+            cooldown = random.randint(60, 180)
+
+            print(f"[YouTube Cooldown] {cooldown}s")
+
+            time.sleep(cooldown)
+
+        delay = random.uniform(
+            YOUTUBE_DELAY_MIN_SECONDS,
+            YOUTUBE_DELAY_MAX_SECONDS
+        )
+
+        time.sleep(delay)
+
+        output_stem = Path(dest_dir) / _sanitize_filename(f"download_{i + 1}")
+        path, _info = download_url(url, output_stem)
+
+        results.append(path)
+
+        # Periodic pause to respect rate limit policies
+        if (i + 1) % max(1, YOUTUBE_DOWNLOAD_WORKERS) == 0:
+            time.sleep(YOUTUBE_RATE_LIMIT_PAUSE_SECONDS)
+    return results
+
+def download_original_audio(song, output_dir):
+    """
+    Download audio for a song object.
+    """
+    title = song.crawled_song_name or song.input_song_name
+    artist = song.crawled_singer_name or song.input_singer_name
+    query = f"{title} {artist} official audio".strip()
+    cache_key = _youtube_cache_key(title, artist)
+    cached_video_id = db.get_cached_video(cache_key)
+    candidates = []
+    if cached_video_id:
+        candidates.append(
+            {
+                "id": cached_video_id,
+                "title": title,
+                "url": f"https://www.youtube.com/watch?v={cached_video_id}",
+            }
+        )
+    candidates.extend(
+        candidate
+        for candidate in search_youtube_candidates(title, artist, max_results=4)
+        if candidate["id"] != cached_video_id
+    )
+
+    if not candidates:
+        raise RuntimeError(f"Khong tim thay YouTube video: {query}")
+
+    output_dir = Path(output_dir)
+    folder_name = sanitize_path(
+        f"{song.crawled_singer_name or 'unknown'} - {song.crawled_song_name or song.song_id or 'unknown'}"
+    )
+
+    track_dir = output_dir / "kpop" / "audio" / "folder_01" / folder_name
+    audio_stem = track_dir / sanitize_path(song.crawled_song_name or song.song_id or "audio")
+
+    last_error = ""
+    audio_path = ""
+    audio_info = {}
+    selected_video = None
+    try:
+        for video in candidates:
+            try:
+                audio_path, audio_info = download_url(video["url"], audio_stem)
+                selected_video = video
+                break
+            except YouTubeRateLimitError:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+
+        if not audio_path or not selected_video:
+            raise RuntimeError(
+                f"Khong tai duoc audio-only m4a tu YouTube: {query}. Loi cuoi: {last_error}"
+            )
+    except Exception:
+        if track_dir.exists():
+            try:
+                shutil.rmtree(track_dir)
+            except Exception:
+                pass
+        raise
+
+    db.save_cached_video(cache_key, selected_video["id"])
+
+    # lưu path thật trên máy
+    song.audio_path = audio_path
+
+    # path chuẩn khách yêu cầu cho jsonl
+    audio_real_path = Path(audio_path)
+    song.local_audio_path = audio_real_path.relative_to(output_dir).as_posix()
+    lyric_real_path = audio_real_path.with_suffix(".krc")
+
+    # tạo folder nếu chưa có
+    lyric_real_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # save lyric file
+    with open(lyric_real_path, "w", encoding="utf-8") as f:
+        f.write(song.lyrics or "")
+
+    # path cho jsonl
+    song.lyric_path = lyric_real_path.relative_to(output_dir).as_posix()
+    song.duration = round(float(audio_info.get("duration") or 0), 2)
+    sample_rate = audio_info.get("asr") or 44100
+    try:
+        song.sample_rate = f"{float(sample_rate) / 1000:.1f}kHz"
+    except (TypeError, ValueError):
+        song.sample_rate = "44.1kHz"
+
+    return song

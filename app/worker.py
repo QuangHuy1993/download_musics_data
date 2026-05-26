@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import threading
 import time
+import gc
+import random
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -12,7 +15,8 @@ from .google_sheet import SheetSyncer
 from .lyrics import enrich_lyrics
 from .melon import crawl_song
 from .models import SongRecord
-
+from .jsonl_exporter import ensure_delivery_structure, song_to_json, write_jsonl
+from .utils import is_korean_lyrics, korean_lyrics_score
 
 class JobRunner:
     def __init__(self, db: JobDB, sheet_syncer: SheetSyncer):
@@ -30,11 +34,13 @@ class JobRunner:
             "logs": [],
             "pausedReason": "",
         }
+        self.seen_keys = set()
+        self.export_lock = threading.Lock()
 
     def start(
         self,
         output_dir: Path,
-        workers: int = 10,
+        workers: int = 3,
         max_items: int = 0,
         start_row: int = 0,
         end_row: int = 0,
@@ -42,6 +48,8 @@ class JobRunner:
         if self.thread and self.thread.is_alive():
             raise RuntimeError("Job dang chay.")
         self.stop_event.clear()
+        self.seen_keys = set()
+        batch_id = self.db.create_new_batch()
         self.state.update({
             "running": True,
             "startedAt": time.time(),
@@ -54,6 +62,7 @@ class JobRunner:
             "endRow": end_row,
             "logs": [],
             "pausedReason": "",
+            "batchId": batch_id,
         })
         self.thread = threading.Thread(
             target=self.run,
@@ -70,6 +79,7 @@ class JobRunner:
         self.db.reset_running()
         resumed_count = self.db.resume_paused_youtube(start_row, end_row)
         self.sheet_syncer.start()
+        ensure_delivery_structure(output_dir)
         limit_text = f", gioi han {max_items} bai" if max_items else ""
         range_text = ""
         if start_row or end_row:
@@ -98,16 +108,36 @@ class JobRunner:
                     if free_slots > 0:
                         batch = self.db.claim_pending(free_slots, start_row, end_row)
                         if not batch and not active_futures:
-                            retry_count = self.db.retry_failed_as_pending(
-                                start_row,
-                                end_row,
-                                MAX_NORMAL_RETRY_ATTEMPTS,
-                            )
-                            if retry_count:
-                                self.log(
-                                    f"Da chay het pending, dua {retry_count} bai loi ve cuoi hang doi de thu lai."
+
+                            failed_stats = self.db.stats().get("failed", 0)
+
+                            if failed_stats > 0:
+
+                                self.log("Cho cooldown truoc khi retry failed jobs")
+
+                                time.sleep(random.randint(60, 180))
+
+                                retry_count = self.db.retry_failed_as_pending(
+                                    start_row,
+                                    end_row,
+                                    MAX_NORMAL_RETRY_ATTEMPTS,
                                 )
-                                batch = self.db.claim_pending(free_slots, start_row, end_row)
+
+                                if retry_count:
+                                    self.log(
+                                        f"Da chay het pending, dua {retry_count} bai loi ve cuoi hang doi de thu lai."
+                                    )
+
+                                    batch = self.db.claim_pending(
+                                        free_slots,
+                                        start_row,
+                                        end_row
+                                    )
+                            else:
+
+                                self.log("Tat ca bai hat da xu ly xong.")
+
+                                break
                         for song in batch:
                             future = executor.submit(self.process_one, song, output_dir)
                             active_futures.add(future)
@@ -123,6 +153,10 @@ class JobRunner:
                     for future in done:
                         try:
                             future.result()
+                            del future
+                            if self.state["doneThisRun"] % 100 == 0:
+                                gc.collect()
+
                         except YouTubeRateLimitError as e:
                             message = str(e)
                             self.state["pausedReason"] = message
@@ -133,22 +167,91 @@ class JobRunner:
                             self.log(f"He thong loi luong worker: {str(e)}")
                         self.state["doneThisRun"] += 1
                         self.update_rate()
+                        if self.state["doneThisRun"] % 50 == 0:
 
+                            cooldown = random.randint(120, 300)
+
+                            self.log(f"[Global Cooldown] sleeping={cooldown}s")
+
+                            time.sleep(cooldown)
+
+            self.export_sorted_jsonl(output_dir, self.state["batchId"])
             self.log("Hoan tat job.")
         finally:
             self.state["running"] = False
             self.update_rate()
 
+    def export_sorted_jsonl(self, output_dir: Path, batch_id: int):
+
+        with self.export_lock:
+            structure = ensure_delivery_structure(output_dir)
+            rows = self.db.get_done_songs(None)
+            rows.sort(key=lambda x: x.source_row)
+            write_jsonl(
+                structure["meta_path"],
+                [song_to_json(song) for song in rows],
+            )
     def process_one(self, song: SongRecord, output_dir: Path):
         try:
             import random
-            time.sleep(random.uniform(0.05, 0.2)) # Stagger threads slightly to avoid concurrent spikes
+            time.sleep(random.uniform(1.0, 5.0)) # Stagger threads slightly to avoid concurrent spikes
             self.log(f"Dang xu ly row {song.source_row}: {song.input_song_url}")
             song = crawl_song(song)
+            dedupe_key = (
+                song.crawled_song_name.strip().lower(),
+                song.crawled_singer_name.strip().lower()
+            )
+
+            if dedupe_key in self.seen_keys:
+                raise RuntimeError(f"Skip: duplicate trong cung batch: {song.crawled_song_name}")
+
+            self.seen_keys.add(dedupe_key)
             song = enrich_lyrics(song)
-            # Lyrics are optional (e.g., for instrumentals), so we do not fail if empty
+
+            song.lyrics = (song.lyrics or "").strip()
+            if not song.lyrics:
+                raise RuntimeError("Skip: khong co lyrics hop le tren Melon/nguon fallback")
+
+            if not is_korean_lyrics(song.lyrics):
+                score = korean_lyrics_score(song.lyrics)
+                raise RuntimeError(
+                    "Skip: lyrics khong phai tieng Han "
+                    f"(hangul={score['hangul']}, ratio={score['hangul_ratio']:.2f})"
+                )
+
+            song.language = "韩语"
+            song.language_code = "ko"
             song = download_original_audio(song, output_dir)
+
+            song.crawled_song_name = (song.crawled_song_name or "").strip()
+
+            song.crawled_singer_name = (song.crawled_singer_name or "").strip()
+
+            song.audio_path = (song.audio_path or "").strip()
+
+            meta_dir = output_dir / "meta"
+
+            if not song.crawled_song_name:
+                raise RuntimeError("Thieu ten bai hat")
+
+            if not song.crawled_singer_name:
+                raise RuntimeError("Thieu ten ca si")
+
+            if not song.lyrics:
+                raise RuntimeError("Lyrics khong hop le")
+
+            if not song.audio_path:
+                raise RuntimeError("Thieu audio")
+
+            meta_dir.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+            song.batch_id = self.state["batchId"]
+
             self.db.mark_done(song)
+            self.export_sorted_jsonl(output_dir, self.state["batchId"])
+
             self.db.enqueue_sheet(song, "success", success_payload(song))
             self.log(f"Xong row {song.source_row}: {song.crawled_song_name}")
         except Exception as error:
@@ -157,6 +260,11 @@ class JobRunner:
                 self.db.mark_paused_youtube(song, message)
                 self.log(message)
                 raise
+            if message.startswith("Skip:"):
+                self.db.mark_skipped(song, message)
+                self.db.enqueue_sheet(song, "error", error_payload(song, message))
+                self.log(f"Bo qua row {song.source_row}: {message}")
+                return
             self.db.mark_failed(song, message)
             self.db.enqueue_sheet(song, "error", error_payload(song, message))
             self.log(f"Loi row {song.source_row}: {message}")
@@ -171,7 +279,7 @@ class JobRunner:
         self.state["logs"].append({"time": time.time(), "message": message})
         self.state["logs"] = self.state["logs"][-200:]
 
-
+    
 def success_payload(song: SongRecord) -> dict:
     return {
         "source_row": song.source_row,

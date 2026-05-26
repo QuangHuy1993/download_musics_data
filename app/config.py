@@ -12,6 +12,19 @@ else:
     ROOT = Path(__file__).resolve().parents[1]
     BUNDLE_ROOT = ROOT
 
+# Load environment variables from .env file if it exists
+env_file = ROOT / ".env"
+if env_file.exists():
+    with env_file.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, val = line.split("=", 1)
+                os.environ[key.strip()] = val.strip().strip("'\"")
+
+
 STATIC_DIR = BUNDLE_ROOT / "static"
 DATA_DIR = Path(os.environ.get("MELON_DATA_DIR", ROOT / "data")).expanduser()
 DEFAULT_OUTPUT_DIR = Path(os.environ.get("MELON_OUTPUT_DIR", ROOT / "output")).expanduser()
@@ -27,9 +40,9 @@ YTDLP_TIMEOUT_SECONDS = int(os.environ.get("YTDLP_TIMEOUT_SECONDS", "55"))
 # YOUTUBE_DELAY_MIN_SECONDS = float(os.environ.get("YOUTUBE_DELAY_MIN_SECONDS", "8"))
 # YOUTUBE_DELAY_MAX_SECONDS = float(os.environ.get("YOUTUBE_DELAY_MAX_SECONDS", "15"))
 # MELON_MIN_GAP_SECONDS = float(os.environ.get("MELON_MIN_GAP_SECONDS", "3.5"))
-YOUTUBE_DOWNLOAD_WORKERS = int(os.environ.get("YOUTUBE_DOWNLOAD_WORKERS", "2"))
-YOUTUBE_DELAY_MIN_SECONDS = float(os.environ.get("YOUTUBE_DELAY_MIN_SECONDS", "4"))
-YOUTUBE_DELAY_MAX_SECONDS = float(os.environ.get("YOUTUBE_DELAY_MAX_SECONDS", "8"))
+YOUTUBE_DOWNLOAD_WORKERS = int(os.environ.get("YOUTUBE_DOWNLOAD_WORKERS", "1"))
+YOUTUBE_DELAY_MIN_SECONDS = float(os.environ.get("YOUTUBE_DELAY_MIN_SECONDS", "5"))
+YOUTUBE_DELAY_MAX_SECONDS = float(os.environ.get("YOUTUBE_DELAY_MAX_SECONDS", "15"))
 YOUTUBE_RATE_LIMIT_PAUSE_SECONDS = float(os.environ.get("YOUTUBE_RATE_LIMIT_PAUSE_SECONDS", "3600"))
 MELON_MIN_GAP_SECONDS = float(os.environ.get("MELON_MIN_GAP_SECONDS", "3.0"))
 SHEET_FLUSH_INTERVAL_SECONDS = float(os.environ.get("SHEET_FLUSH_INTERVAL_SECONDS", "5"))

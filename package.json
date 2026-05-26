@@ -5,7 +5,7 @@
   "description": "Local web app: crawl Melon metadata/lyrics and download audio via yt-dlp.",
   "main": "main.js",
   "scripts": {
-    "start": "electron .",
+    "start": "node scripts/start-electron.js",
     "server": "PATH=.venv/bin:$PATH python3 -m app.server",
     "build:win": "electron-builder --win --publish never",
     "build:mac": "electron-builder --mac --publish never"

@@ -15,3 +15,11 @@ downloads/
 *.part
 *.xlsx
 ~$*.xlsx
+
+# Large files and IDE metadata
+不重复的韩语歌曲-wq_kpop_meta.jsonl
+.env
+.vs/
+*.m4a
+*.pdf
+

@@ -46,7 +46,7 @@
               </div>
               
               <!-- Standard File Fallback (hidden in Electron) -->
-              <input id="excelFile" type="file" accept=".xlsx" class="fallback-input">
+              <input id="excelFile" class="hidden" type="file" accept=".xlsx">
             </div>
 
             <!-- Output Folder Picker -->
@@ -80,11 +80,12 @@
                 <label>YouTube Cookies</label>
                 <span id="cookieBadge" class="badge badge-none">Không có cookie</span>
               </div>
-              <div class="cookie-actions-row">
-                <button id="extractChromeBtn" type="button" class="btn-sub">Chrome</button>
-                <button id="extractEdgeBtn" type="button" class="btn-sub">Edge</button>
-                <button id="extractSafariBtn" type="button" class="btn-sub">Safari</button>
-                <button id="extractFirefoxBtn" type="button" class="btn-sub">Firefox</button>
+              <div class="cookie-actions-row" style="align-items: center; justify-content: space-between;">
+                <button id="autoYoutubeCookieBtn" type="button" class="btn-sub">YouTube Auto</button>
+                <div class="checkbox-wrapper" style="display: flex; align-items: center; gap: 6px;">
+                  <input id="enableAutoCookie" type="checkbox" checked style="cursor: pointer; width: 14px; height: 14px;">
+                  <label for="enableAutoCookie" style="font-size: 11px; font-weight: normal; color: #475569; margin: 0; cursor: pointer; user-select: none; white-space: nowrap;">Tự lấy cookie khi lỗi</label>
+                </div>
               </div>
               <textarea id="cookiesText" rows="3" placeholder="Dán nội dung Netscape cookies.txt tại đây..."></textarea>
               <button id="saveCookiesBtn" type="button" class="btn-secondary btn-sm">Lưu Cookies</button>

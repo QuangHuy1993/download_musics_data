@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import ssl
-import urllib.request
-import urllib.error
 import re
 import time
 import threading
-import http.cookiejar
 import random
+import requests
 
 from .config import MELON_MIN_GAP_SECONDS
 from .models import SongRecord
@@ -21,22 +18,36 @@ from .utils import clean_lyrics, clean_text, extract_first
 _MELON_MIN_GAP: float = MELON_MIN_GAP_SECONDS
 _melon_lock = threading.Lock()
 _melon_next: float = 0.0
+_session_request_count = 0
+_session = None
+_request_counter = 0
 
-_cookie_jar = http.cookiejar.CookieJar()
-_opener = urllib.request.build_opener(
-    urllib.request.HTTPCookieProcessor(_cookie_jar),
-    urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
-)
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://www.melon.com/",
-}
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/123.0 Safari/537.36",
+
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
+
+]
+
+def build_headers():
+    return {
+    "User-Agent": random.choice(USER_AGENTS),
+
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
+
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+
+        "Referer": "https://www.melon.com/",
+
+        "Connection": "keep-alive",
+    }
+
 
 
 def _is_placeholder_name(name: str) -> bool:
@@ -63,54 +74,199 @@ def _is_placeholder_name(name: str) -> bool:
     # Còn ký tự nhưng tất cả là '?' → encoding bị mất → hỏng
     return all(c == '?' for c in exotic)
 
+def create_session():
+    session = requests.Session()
+
+    session.headers.update(build_headers())
+
+    return session
+
+def get_session():
+    global _session
+    global _session_request_count
+
+    if _session is None:
+        _session = create_session()
+
+    if _session_request_count >= 300:
+        try:
+            _session.close()
+        except:
+            pass
+
+        _session = create_session()
+        _session_request_count = 0
+
+    _session_request_count += 1
+
+    return _session
+
+def warmup_navigation(session):
+    pages = [
+    "https://www.melon.com/",
+    "https://www.melon.com/chart/index.htm",
+    ]
+
+    try:
+        page = random.choice(pages)
+
+        session.get(
+            page,
+            headers=build_headers(),
+            timeout=10
+        )
+
+        time.sleep(random.uniform(2, 5))
+
+    except:
+        pass
+
+
+def extract_meta_value(html: str, label: str) -> str:
+    pattern = (
+        r"<dt>\s*"
+        + re.escape(label)
+        + r"\s*</dt>\s*<dd[^>]*>(.*?)</dd>"
+    )
+    return clean_text(extract_first(html, pattern))
+
+
+def split_genre(value: str) -> tuple[str, str]:
+    parts = [part.strip() for part in str(value or "").split(",") if part.strip()]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], parts[0]
+    return parts[0], parts[1]
+
+
+def extract_count_text(html: str, element_id: str) -> str:
+    return clean_text(extract_first(
+        html,
+        rf'<[^>]+id=["\']{re.escape(element_id)}["\'][^>]*>(.*?)</[^>]+>'
+    ))
+
+
+def extract_producers(html: str) -> dict[str, str]:
+    result = {"작사": [], "작곡": [], "편곡": []}
+    section = extract_first(
+        html,
+        r'<div[^>]+class=["\']section_prdcr["\'][^>]*>(.*?)</div>\s*<!--\s*//작사 / 작곡\s*-->',
+    )
+    if not section:
+        return {"lyricist": "", "composer": "", "arranger": ""}
+
+    for item in re.findall(r"<li>(.*?)</li>", section, flags=re.IGNORECASE | re.DOTALL):
+        name = clean_text(extract_first(
+            item,
+            r'<a[^>]+class=["\']artist_name["\'][^>]*>(.*?)</a>'
+        ))
+        role = clean_text(extract_first(
+            item,
+            r'<span[^>]+class=["\']type["\'][^>]*>(.*?)</span>'
+        ))
+        if name and role in result and name not in result[role]:
+            result[role].append(name)
+
+    return {
+        "lyricist": ", ".join(result["작사"]),
+        "composer": ", ".join(result["작곡"]),
+        "arranger": ", ".join(result["편곡"]),
+    }
+
 
 def fetch_text(url: str) -> str:
-    """
-    Gửi request tới Melon với rate limit chính xác.
-    Gap được tính từ ĐẦU request này đến ĐẦU request tiếp theo
-    (không phải từ cuối → đầu), nên HTTP latency không bị cộng thêm.
-    Có jitter nhẹ để tránh pattern đều tuyệt đối.
-    """
     global _melon_next
+    global _request_counter
 
     retries = 3
+
     for attempt in range(retries):
-        # Chờ trong lock đến khi đến lượt, rồi đặt lịch cho request kế tiếp
+
         with _melon_lock:
+
+            _request_counter += 1
+
+            # Burst cooldown
+            if _request_counter % 20 == 0:
+                cooldown = random.randint(60, 240)
+
+                print(f"[Cooldown] Sleeping {cooldown}s")
+
+                time.sleep(cooldown)
+
+            # Global request gap
             wait = _melon_next - time.monotonic()
+
             if wait > 0:
                 time.sleep(wait)
-            _melon_next = time.monotonic() + _MELON_MIN_GAP + random.uniform(0.2, 1.2)
 
-        # Gửi request NGOÀI lock → các thread khác có thể pre-book slot chờ
-        req = urllib.request.Request(url, headers=_HEADERS)
+            _melon_next = (
+                time.monotonic()
+                + _MELON_MIN_GAP
+                + random.uniform(0.5, 3.0)
+            )
+
         try:
-            with _opener.open(req, timeout=15) as response:
-                charset = response.headers.get_content_charset() or "utf-8"
-                return response.read().decode(charset, errors="replace")
 
-        except urllib.error.HTTPError as e:
-            if e.code == 406:
-                # WAF block → cộng thêm 15s penalty để tất cả thread sau tự chờ
+            session = get_session()
+
+            # Human-like navigation
+            if random.random() < 0.3:
+                warmup_navigation(session)
+
+            response = session.get(
+                url,
+                headers=build_headers(),
+                timeout=15
+            )
+
+            response.raise_for_status()
+
+            response.encoding = response.apparent_encoding
+
+            return response.text
+
+        except requests.HTTPError as e:
+
+            status_code = e.response.status_code
+
+            if status_code == 406:
+
                 with _melon_lock:
-                    _melon_next = max(_melon_next, time.monotonic() + _MELON_MIN_GAP + 15.0)
+                    _melon_next = max(
+                        _melon_next,
+                        time.monotonic() + _MELON_MIN_GAP + 15.0
+                    )
+
                 if attempt < retries - 1:
                     continue
-                raise
-            # Lỗi HTTP khác (404, 5xx...)
+
             if attempt < retries - 1:
                 continue
+
             raise
 
-        except (urllib.error.URLError, TimeoutError, OSError):
-            # Mất mạng tạm thời → thêm 3s buffer
+        except (
+            requests.ConnectionError,
+            requests.Timeout,
+            OSError
+        ):
+
             with _melon_lock:
-                _melon_next = max(_melon_next, time.monotonic() + _MELON_MIN_GAP + 3.0)
+                _melon_next = max(
+                    _melon_next,
+                    time.monotonic() + _MELON_MIN_GAP + 3.0
+                )
+
             if attempt < retries - 1:
                 continue
+
             raise
 
-    raise RuntimeError(f"Khong the lay du lieu Melon sau {retries} lan thu: {url}")
+    raise RuntimeError(
+        f"Khong the lay du lieu Melon sau {retries} lan thu: {url}"
+    )
 
 
 def crawl_song(song: SongRecord) -> SongRecord:
@@ -137,6 +293,13 @@ def crawl_song(song: SongRecord) -> SongRecord:
         title = title.removeprefix("곡명").strip()
         artist = clean_text(extract_first(html, r'<a[^>]+class=["\']artist_name["\'][^>]*>.*?<span[^>]*>(.*?)</span>'))
         lyrics_html = extract_first(html, r'<div[^>]+id=["\']d_video_summary["\'][^>]*>(.*?)</div>')
+        album = extract_meta_value(html, "앨범")
+        release_date = extract_meta_value(html, "발매일")
+        genre = extract_meta_value(html, "장르")
+        major_genre, sub_genre = split_genre(genre)
+        producers = extract_producers(html)
+        like_count = extract_count_text(html, "d_like_count")
+        comment_count = extract_count_text(html, "revCnt")
 
         # Ghi đè fallback chỉ khi Melon trả về giá trị thực
         if title and not _is_placeholder_name(title):
@@ -145,6 +308,18 @@ def crawl_song(song: SongRecord) -> SongRecord:
             song.crawled_singer_name = artist
         if lyrics_html:
             song.lyrics = clean_lyrics(lyrics_html)
+        if album:
+            song.album = album
+        if major_genre:
+            song.major_genre = major_genre
+        if sub_genre:
+            song.sub_genre = sub_genre
+        song.release_date = release_date or song.release_date
+        song.lyricist = producers["lyricist"] or song.lyricist
+        song.composer = producers["composer"] or song.composer
+        song.arranger = producers["arranger"] or song.arranger
+        song.like_count = like_count or song.like_count
+        song.comment_count = comment_count or song.comment_count
 
     except Exception as e:
         # Bước 3: Melon thất bại → kiểm tra chất lượng dữ liệu fallback
