@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import sys
+import re
+import random
 from pathlib import Path
 
 
@@ -48,3 +50,32 @@ MELON_MIN_GAP_SECONDS = float(os.environ.get("MELON_MIN_GAP_SECONDS", "3.0"))
 SHEET_FLUSH_INTERVAL_SECONDS = float(os.environ.get("SHEET_FLUSH_INTERVAL_SECONDS", "5"))
 SHEET_BATCH_SIZE = int(os.environ.get("SHEET_BATCH_SIZE", "50"))
 MAX_NORMAL_RETRY_ATTEMPTS = int(os.environ.get("MAX_NORMAL_RETRY_ATTEMPTS", "3"))
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+PROXIES = []
+if PROXY_URL:
+    cleaned = PROXY_URL.replace("\"", "").replace("'", "")
+    for part in re.split(r'[,\n;]+', cleaned):
+        part = part.strip()
+        if part:
+            if not part.startswith("http://") and not part.startswith("https://"):
+                part = "http://" + part
+            PROXIES.append(part)
+
+def get_random_proxy() -> str | None:
+    if not PROXIES:
+        return None
+    return random.choice(PROXIES)
+
+def mask_proxy(proxy_url: str) -> str:
+    if not proxy_url:
+        return ""
+    return re.sub(r'(https?://[^:]+):[^@]+@', r'\1:***@', proxy_url)
+
+# Configure global urllib opener if proxies are available to prevent leaks
+if PROXIES:
+    import urllib.request
+    proxy = get_random_proxy()
+    if proxy:
+        proxy_handler = urllib.request.ProxyHandler({'http': proxy, 'https': proxy})
+        opener = urllib.request.build_opener(proxy_handler)
+        urllib.request.install_opener(opener)

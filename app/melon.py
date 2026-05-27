@@ -6,7 +6,7 @@ import threading
 import random
 import requests
 
-from .config import MELON_MIN_GAP_SECONDS
+from .config import MELON_MIN_GAP_SECONDS, get_random_proxy, mask_proxy
 from .models import SongRecord
 from .utils import clean_lyrics, clean_text, extract_first
 
@@ -101,7 +101,7 @@ def get_session():
 
     return _session
 
-def warmup_navigation(session):
+def warmup_navigation(session, proxy=None):
     pages = [
     "https://www.melon.com/",
     "https://www.melon.com/chart/index.htm",
@@ -113,6 +113,7 @@ def warmup_navigation(session):
         session.get(
             page,
             headers=build_headers(),
+            proxies={"http": proxy, "https": proxy} if proxy else None,
             timeout=10
         )
 
@@ -188,8 +189,8 @@ def fetch_text(url: str) -> str:
             _request_counter += 1
 
             # Burst cooldown
-            if _request_counter % 20 == 0:
-                cooldown = random.randint(80, 140)
+            if not get_random_proxy() and _request_counter % 50 == 0:
+                cooldown = random.randint(15, 30)
 
                 print(f"[Cooldown] Sleeping {cooldown}s")
 
@@ -201,23 +202,31 @@ def fetch_text(url: str) -> str:
             if wait > 0:
                 time.sleep(wait)
 
+            min_gap = 1.0 if get_random_proxy() else _MELON_MIN_GAP
+            random_gap = random.uniform(0.2, 0.8) if get_random_proxy() else random.uniform(0.5, 3.0)
+
             _melon_next = (
                 time.monotonic()
-                + _MELON_MIN_GAP
-                + random.uniform(0.5, 3.0)
+                + min_gap
+                + random_gap
             )
 
         try:
 
             session = get_session()
 
+            proxy = get_random_proxy()
             # Human-like navigation
             if random.random() < 0.3:
-                warmup_navigation(session)
+                warmup_navigation(session, proxy)
 
+            proxy = get_random_proxy()
+            if proxy:
+                print(f"[Melon Crawl Proxy] -> {mask_proxy(proxy)}")
             response = session.get(
                 url,
                 headers=build_headers(),
+                proxies={"http": proxy, "https": proxy} if proxy else None,
                 timeout=15
             )
 

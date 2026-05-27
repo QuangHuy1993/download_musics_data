@@ -42,7 +42,6 @@ except Exception:
         raise ImportError(
             "yt_dlp is required by app.downloader. Install with: pip install yt-dlp"
         ) from exc
-
 from .config import (
     DATA_DIR,
     YTDLP_TIMEOUT_SECONDS,
@@ -50,6 +49,8 @@ from .config import (
     YOUTUBE_DELAY_MIN_SECONDS,
     YOUTUBE_DOWNLOAD_WORKERS,
     YOUTUBE_RATE_LIMIT_PAUSE_SECONDS,
+    get_random_proxy,
+    mask_proxy,
 )
 
 # Minimal, robust downloader utilities
@@ -167,6 +168,10 @@ def search_youtube_candidates(title: str, artist: str = "", max_results: int = 1
         "ignoreerrors": True,
         "extractor_args": {"youtube": {"player_client": ["ios", "android"]}},
     }
+    proxy = get_random_proxy()
+    if proxy:
+        ydl_opts["proxy"] = proxy
+        print(f"[YouTube Search Proxy] -> {mask_proxy(proxy)}")
     cookie_file = DATA_DIR / "cookies.txt"
     if use_cookies and cookie_file.exists():
         ydl_opts["cookiefile"] = str(cookie_file)
@@ -263,6 +268,10 @@ def search_soundcloud_candidates(title: str, artist: str = "", max_results: int 
         "extract_flat": True,
         "ignoreerrors": True,
     }
+    proxy = get_random_proxy()
+    if proxy:
+        ydl_opts["proxy"] = proxy
+        print(f"[SoundCloud Search Proxy] -> {mask_proxy(proxy)}")
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -372,6 +381,10 @@ def download_url(url: str, output_stem: Path, timeout: int | None = None, use_co
         },
 
     }
+    proxy = get_random_proxy()
+    if proxy:
+        base_opts["proxy"] = proxy
+        print(f"[Download Proxy] -> {mask_proxy(proxy)} | URL: {url}")
     cookie_opts = {}
     cookie_file = DATA_DIR / "cookies.txt"
     if use_cookies and cookie_file.exists():
