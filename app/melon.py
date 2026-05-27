@@ -281,14 +281,12 @@ def fetch_text(url: str) -> str:
 def crawl_song(song: SongRecord) -> SongRecord:
     """
     Crawl tên bài, nghệ sĩ và lyrics từ Melon.
-
-    Logic ưu tiên (quan trọng — đọc kỹ):
-      1. Melon thành công → dùng data Melon (nguồn chính xác nhất)
-      2. Melon thất bại + Excel có tên hợp lệ → dùng Excel (vẫn tải được nhạc)
-      3. Melon thất bại + Excel bị ???? → raise RuntimeError
-         → worker.py sẽ mark_failed → song được retry ở lần chạy sau
-         → KHÔNG bao giờ lưu tên ???? vào database
     """
+    # Nếu đã có sẵn dữ liệu crawl từ trước (do chạy lại bài hát cũ hoặc retry), bỏ qua crawl Melon để tiết kiệm request
+    if song.crawled_song_name and not _is_placeholder_name(song.crawled_song_name) and song.lyrics:
+        print(f"[Melon Cache] Bo qua crawl cho bai: {song.crawled_song_name} (Da co san metadata)")
+        return song
+
     # Bước 1: Cấu hình fallback từ Excel (sẽ bị ghi đè nếu Melon thành công)
     song.crawled_song_name = song.input_song_name or ""
     song.crawled_singer_name = song.input_singer_name or ""
